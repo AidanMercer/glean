@@ -1,0 +1,509 @@
+//! Words -> lines -> columns -> blocks -> tables.
+//!
+//! The whole design rests on one observation from benchmarking anydoc against
+//! PyMuPDF4LLM on real appraisals: borderless financial tables have no drawing
+//! operations to key off, so the only reliable signal is *vertical whitespace
+//! corridors* — x ranges that no word crosses on any row of the block. Detecting
+//! columns that way handles ruled and unruled tables identically, and copes with
+//! empty cells, which x-anchor clustering does not.
+
+use crate::ffi::Word;
+
+#[derive(Debug, Clone)]
+pub struct Line {
+    pub words: Vec<Word>,
+    pub y: f64,
+    pub size: f64,
+    pub x0: f64,
+    pub x1: f64,
+}
+
+impl Line {
+    pub fn text(&self) -> String {
+        let mut s = String::new();
+        for (i, w) in self.words.iter().enumerate() {
+            if i > 0 {
+                s.push(' ');
+            }
+            s.push_str(&w.text);
+        }
+        s
+    }
+    pub fn bold(&self) -> bool {
+        !self.words.is_empty() && self.words.iter().all(|w| w.bold)
+    }
+}
+
+#[derive(Debug)]
+pub enum Block {
+    Para(Vec<Line>),
+    Heading(u8, Line),
+    Table(Table),
+}
+
+#[derive(Debug)]
+pub struct Table {
+    pub rows: Vec<Vec<String>>,
+    pub header: bool,
+}
+
+/// Group words into lines by vertical overlap. Poppler emits reading-order
+/// words, but rows of a table interleave, so cluster on y explicitly.
+pub fn lines(mut words: Vec<Word>) -> Vec<Line> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+    words.sort_by(|a, b| {
+        a.ymid()
+            .partial_cmp(&b.ymid())
+            .unwrap()
+            .then(a.x0.partial_cmp(&b.x0).unwrap())
+    });
+
+    let mut out: Vec<Vec<Word>> = Vec::new();
+    for w in words {
+        let placed = out.last_mut().is_some_and(|cur| {
+            let cy = cur.iter().map(|c| c.ymid()).sum::<f64>() / cur.len() as f64;
+            let h = cur.iter().map(|c| c.y1 - c.y0).sum::<f64>() / cur.len() as f64;
+            let tol = (h * 0.55).max(1.2);
+            if (w.ymid() - cy).abs() <= tol {
+                cur.push(w.clone());
+                true
+            } else {
+                false
+            }
+        });
+        if !placed {
+            out.push(vec![w]);
+        }
+    }
+
+    out.into_iter()
+        .map(|mut ws| {
+            ws.sort_by(|a, b| a.x0.partial_cmp(&b.x0).unwrap());
+            let ws = merge_tracking(ws);
+            let y = ws.iter().map(|w| w.ymid()).sum::<f64>() / ws.len() as f64;
+            let size = median(&mut ws.iter().map(|w| w.size).collect::<Vec<_>>());
+            let x0 = ws.iter().map(|w| w.x0).fold(f64::MAX, f64::min);
+            let x1 = ws.iter().map(|w| w.x1).fold(f64::MIN, f64::max);
+            Line { words: ws, y, size, x0, x1 }
+        })
+        .collect()
+}
+
+/// Rejoin glyph runs split by letter-spacing. The appraisals in the test corpus
+/// set headings with tracking, so poppler reports "T ota l Reta i l" as six
+/// words; a keyword search for "Total Retail" then finds nothing. Anything
+/// closer than a fraction of an em is not a word break.
+fn merge_tracking(ws: Vec<Word>) -> Vec<Word> {
+    let mut out: Vec<Word> = Vec::with_capacity(ws.len());
+    for w in ws {
+        let join = out.last().is_some_and(|p: &Word| {
+            let gap = w.x0 - p.x1;
+            let em = p.size.max(w.size).max(1.0);
+            // A real inter-word space is ~0.25em in most faces; tracking gaps
+            // inside a word land well below that, and are often negative.
+            gap < em * 0.16 && (w.ymid() - p.ymid()).abs() < em * 0.4
+        });
+        if join {
+            let p = out.last_mut().unwrap();
+            p.text.push_str(&w.text);
+            p.x1 = w.x1;
+            p.y0 = p.y0.min(w.y0);
+            p.y1 = p.y1.max(w.y1);
+        } else {
+            out.push(w);
+        }
+    }
+    out
+}
+
+pub fn median(v: &mut [f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+/// Split a page into reading-order columns by finding a full-height whitespace
+/// corridor. Only accepts a split that leaves substantial text on both sides,
+/// so a centred heading or a narrow table does not trigger it.
+pub fn columns(lines: &[Line], page_w: f64) -> Vec<Vec<usize>> {
+    let single = vec![(0..lines.len()).collect::<Vec<_>>()];
+    if lines.len() < 8 {
+        return single;
+    }
+    let bins = 200usize;
+    let bw = page_w / bins as f64;
+    let mut occ = vec![0u32; bins];
+    for l in lines {
+        for w in &l.words {
+            let a = ((w.x0 / bw).floor().max(0.0) as usize).min(bins - 1);
+            let b = ((w.x1 / bw).ceil().max(0.0) as usize).min(bins);
+            for o in occ.iter_mut().take(b).skip(a) {
+                *o += 1;
+            }
+        }
+    }
+    // candidate gutters in the middle half of the page
+    let (lo, hi) = (bins * 3 / 10, bins * 7 / 10);
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = lo;
+    while i < hi {
+        if occ[i] == 0 {
+            let s = i;
+            while i < hi && occ[i] == 0 {
+                i += 1;
+            }
+            if best.is_none_or(|(bs, be)| i - s > be - bs) {
+                best = Some((s, i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let Some((s, e)) = best else { return single };
+    if (e - s) as f64 * bw < page_w * 0.035 {
+        return single;
+    }
+    let split = (s + e) as f64 * 0.5 * bw;
+
+    let (mut l, mut r) = (Vec::new(), Vec::new());
+    for (i, ln) in lines.iter().enumerate() {
+        if ln.x1 <= split {
+            l.push(i);
+        } else if ln.x0 >= split {
+            r.push(i);
+        } else {
+            return single; // a line straddles the gutter: not really two columns
+        }
+    }
+    if l.len() < 4 || r.len() < 4 {
+        return single;
+    }
+    vec![l, r]
+}
+
+/// A line looks tabular when it contains internal gaps far wider than *its own*
+/// typical word spacing — i.e. it is laid out in cells rather than flowed.
+///
+/// The comparison has to be relative. Justified prose stretches its spaces to
+/// reach the right margin, so an absolute em threshold flags ordinary body text
+/// as a table; measuring each gap against the line's median gap does not.
+fn tabular(l: &Line) -> bool {
+    if l.words.len() < 3 {
+        return false;
+    }
+    let em = l.size.max(1.0);
+    let gaps: Vec<f64> = l.words.windows(2).map(|p| (p[1].x0 - p[0].x1).max(0.0)).collect();
+    if gaps.len() < 2 {
+        return false;
+    }
+    let mut sorted = gaps.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // The low quartile approximates what an ordinary space looks like on this
+    // line. The median would not: in a row whose cells are mostly single words,
+    // *most* gaps are inter-cell gaps, so the median is itself a cell gap and
+    // nothing ever clears a multiple of it.
+    let space = sorted[sorted.len() / 4].max(0.35);
+
+    let bimodal = gaps.iter().filter(|g| **g > space * 2.5 && **g > em * 0.7).count();
+    let wide = gaps.iter().filter(|g| **g > em * 1.9).count();
+    bimodal >= 2 || wide >= 2
+}
+
+/// Whitespace-corridor column boundaries for a run of lines.
+fn corridors(rows: &[&Line]) -> Vec<(f64, f64)> {
+    let x0 = rows.iter().map(|l| l.x0).fold(f64::MAX, f64::min);
+    let x1 = rows.iter().map(|l| l.x1).fold(f64::MIN, f64::max);
+    if x1 - x0 < 20.0 {
+        return Vec::new();
+    }
+    let bins = 600usize;
+    let bw = (x1 - x0) / bins as f64;
+    let mut occ = vec![0u32; bins];
+    for l in rows {
+        for w in &l.words {
+            let a = (((w.x0 - x0) / bw).floor().max(0.0) as usize).min(bins - 1);
+            let b = (((w.x1 - x0) / bw).ceil().max(0.0) as usize).min(bins);
+            for o in occ.iter_mut().take(b).skip(a) {
+                *o += 1;
+            }
+        }
+    }
+    let em = median(&mut rows.iter().map(|l| l.size).collect::<Vec<_>>()).max(1.0);
+    // This can sit below a single space width because the occupancy test above
+    // already does the discriminating: a gap inside a phrase ("International
+    // Bank - OTL") falls at a different x on every row, so some row fills it,
+    // whereas a real column boundary is clear on every row at the same x. The
+    // width floor is only here to shrug off bin quantisation.
+    let min_gap = (em * 0.30).max(bw * 2.5);
+
+    // A spanning cell — a "2024 Assessment" title sitting across three money
+    // columns — bridges the corridor below it. Requiring strictly zero
+    // occupancy would let one such row erase every column boundary under it,
+    // so tolerate a few crossings before giving up on a gap.
+    // At least one crossing is always tolerated: a short table with a spanning
+    // header would otherwise floor the allowance to zero and lose every column
+    // boundary, which is precisely the case a big table survives by accident.
+    let bridge = (((rows.len() as f64) * 0.15).floor() as u32).max(u32::from(rows.len() >= 3));
+
+    let mut cuts = Vec::new();
+    let mut i = 0;
+    while i < bins {
+        if occ[i] <= bridge {
+            let s = i;
+            while i < bins && occ[i] <= bridge {
+                i += 1;
+            }
+            let (a, b) = (x0 + s as f64 * bw, x0 + i as f64 * bw);
+            if b - a >= min_gap && s > 0 && i < bins {
+                cuts.push((a, b));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    // Build column ranges from the cuts.
+    let mut cols = Vec::new();
+    let mut cur = x0;
+    for (a, b) in &cuts {
+        cols.push((cur, *a));
+        cur = *b;
+    }
+    cols.push((cur, x1));
+    cols.retain(|(a, b)| b - a > bw);
+    cols
+}
+
+fn build_table(rows: &[&Line]) -> Option<Table> {
+    let cols = corridors(rows);
+    if cols.len() < 2 {
+        return None;
+    }
+    let mut grid = Vec::with_capacity(rows.len());
+    for l in rows {
+        let mut cells = vec![String::new(); cols.len()];
+        for w in &l.words {
+            let mid = (w.x0 + w.x1) * 0.5;
+            // nearest column by midpoint, so a word overhanging its cell still lands right
+            let ci = cols
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let da = if mid < a.0 { a.0 - mid } else if mid > a.1 { mid - a.1 } else { 0.0 };
+                    let db = if mid < b.0 { b.0 - mid } else if mid > b.1 { mid - b.1 } else { 0.0 };
+                    da.partial_cmp(&db).unwrap()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            if !cells[ci].is_empty() {
+                cells[ci].push(' ');
+            }
+            cells[ci].push_str(&w.text);
+        }
+        grid.push(cells);
+    }
+    // A table whose rows are nearly all single-cell is really prose.
+    let filled: usize = grid
+        .iter()
+        .map(|r| r.iter().filter(|c| !c.is_empty()).count())
+        .sum();
+    if filled < grid.len() * 2 {
+        return None;
+    }
+    let header = rows.first().is_some_and(|l| l.bold()) || grid.len() > 2;
+    Some(Table { rows: grid, header })
+}
+
+pub fn blocks(lines: &[Line], body: f64, page_h: f64) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        // --- table run ---
+        if tabular(&lines[i]) {
+            let mut j = i + 1;
+            while j < lines.len() {
+                let gap = lines[j].y - lines[j - 1].y;
+                let lim = lines[j].size.max(lines[j - 1].size) * 2.6;
+                // A financial table is interrupted by section labels ("Retail",
+                // "Office Units") and by spanning subtotal rows. Those are part
+                // of the table, and breaking the run on them splits one table
+                // into fragments that each derive their own, disagreeing,
+                // column boundaries. Only flowed prose ends a table.
+                let prose = !tabular(&lines[j]) && lines[j].words.len() > 4;
+                if gap > lim || prose {
+                    break;
+                }
+                j += 1;
+            }
+            if j - i >= 2 {
+                let rows: Vec<&Line> = lines[i..j].iter().collect();
+                if let Some(t) = build_table(&rows) {
+                    out.push(Block::Table(t));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+
+        // --- heading ---
+        let l = &lines[i];
+        let short = (l.x1 - l.x0) < 420.0;
+        // A wrapped prose line can be short and set slightly above the page's
+        // dominant size (a page that is mostly small table type drags the body
+        // estimate down), so size alone promotes body text to headings. Require
+        // it to also *look* like a heading: few words, not a sentence
+        // continuation, and clear of the running head and foot.
+        let in_margin = l.y < page_h * 0.06 || l.y > page_h * 0.94;
+        let continuation = l.words.first().is_some_and(|w| {
+            w.text.chars().next().is_some_and(|c| c.is_lowercase())
+        });
+        let heading_shape = short
+            && !in_margin
+            && !continuation
+            && l.words.len() <= 14
+            && !l.text().trim_end().ends_with(',');
+        if heading_shape && (l.size > body * 1.15 || (l.bold() && l.size >= body)) {
+            let lvl = if l.size > body * 1.9 {
+                1
+            } else if l.size > body * 1.45 {
+                2
+            } else if l.size > body * 1.2 {
+                3
+            } else {
+                4
+            };
+            out.push(Block::Heading(lvl, l.clone()));
+            i += 1;
+            continue;
+        }
+
+        // --- paragraph ---
+        let mut j = i + 1;
+        while j < lines.len() {
+            let gap = lines[j].y - lines[j - 1].y;
+            let lim = lines[j].size.max(lines[j - 1].size) * 1.9;
+            if gap > lim || tabular(&lines[j]) || lines[j].size > body * 1.12 {
+                break;
+            }
+            j += 1;
+        }
+        out.push(Block::Para(lines[i..j].to_vec()));
+        i = j;
+    }
+    out
+}
+
+/// Dominant body font size, weighted by how much text is set in it.
+pub fn body_size(lines: &[Line]) -> f64 {
+    let mut buckets: Vec<(f64, usize)> = Vec::new();
+    for l in lines {
+        let n: usize = l.words.iter().map(|w| w.text.len()).sum();
+        let s = (l.size * 4.0).round() / 4.0;
+        match buckets.iter_mut().find(|(b, _)| (*b - s).abs() < 0.13) {
+            Some((_, c)) => *c += n,
+            None => buckets.push((s, n)),
+        }
+    }
+    buckets
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(s, _)| s)
+        .unwrap_or(10.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a line of words at given x positions, all one font size.
+    fn line(size: f64, spans: &[(f64, f64, &str)]) -> Line {
+        let words: Vec<Word> = spans
+            .iter()
+            .map(|&(x0, x1, t)| Word {
+                x0,
+                y0: 0.0,
+                x1,
+                y1: size,
+                size,
+                bold: false,
+                text: t.to_string(),
+            })
+            .collect();
+        let x0 = words.iter().map(|w| w.x0).fold(f64::MAX, f64::min);
+        let x1 = words.iter().map(|w| w.x1).fold(f64::MIN, f64::max);
+        Line { words, y: 0.0, size, x0, x1 }
+    }
+
+    #[test]
+    fn tracking_is_rejoined() {
+        // "O ffic e" as poppler reports a letter-spaced heading.
+        let ws = line(10.0, &[(0.0, 6.0, "O"), (6.5, 20.0, "ffic"), (20.4, 26.0, "e")]).words;
+        let merged = merge_tracking(ws);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Office");
+    }
+
+    #[test]
+    fn real_word_breaks_survive() {
+        // A normal space is far wider than a tracking gap and must not merge.
+        let ws = line(10.0, &[(0.0, 20.0, "Total"), (23.0, 45.0, "Retail")]).words;
+        assert_eq!(merge_tracking(ws).len(), 2);
+    }
+
+    #[test]
+    fn justified_prose_is_not_a_table() {
+        // Stretched spaces in justified body text: uniform, ~1.4x a normal space.
+        let l = line(
+            9.0,
+            &[(0.0, 30.0, "The"), (34.0, 70.0, "assessed"), (74.0, 100.0, "value"),
+              (104.0, 130.0, "is"), (134.0, 170.0, "the")],
+        );
+        assert!(!tabular(&l), "justified prose must not read as tabular");
+    }
+
+    #[test]
+    fn cell_row_is_a_table() {
+        // "311 Marlow Road   311   00593101   $1,250,000" — tight inside a cell,
+        // wide between cells.
+        let l = line(
+            7.0,
+            &[(0.0, 12.0, "311"), (13.0, 40.0, "North"), (41.0, 60.0, "Road"),
+              (100.0, 112.0, "311"), (150.0, 190.0, "00593101"), (240.0, 290.0, "$1,250,000")],
+        );
+        assert!(tabular(&l), "a cell-laid-out row must read as tabular");
+    }
+
+    #[test]
+    fn spanning_header_does_not_erase_columns() {
+        // One title spans three money columns; the rows below share clean gaps.
+        // Requiring strictly-zero occupancy would collapse all three into one.
+        let span = line(7.0, &[(100.0, 290.0, "2024 Assessment")]);
+        let r1 = line(7.0, &[(100.0, 140.0, "$1,250,000"), (180.0, 220.0, "$417,000"),
+                             (250.0, 290.0, "$1,667,000")]);
+        let r2 = line(7.0, &[(100.0, 140.0, "$1,252,000"), (180.0, 220.0, "$418,000"),
+                             (250.0, 290.0, "$1,670,000")]);
+        let r3 = line(7.0, &[(100.0, 140.0, "$1,600,000"), (180.0, 220.0, "$533,000"),
+                             (250.0, 290.0, "$2,133,000")]);
+        let rows: Vec<&Line> = vec![&span, &r1, &r2, &r3];
+        assert!(corridors(&rows).len() >= 3, "spanning cell must not collapse columns");
+    }
+
+    #[test]
+    fn empty_cells_keep_their_column() {
+        // A tenant with no renewal option leaves a hole; later columns must not
+        // shift left into it.
+        let r1 = line(7.0, &[(0.0, 20.0, "506"), (40.0, 90.0, "Bank"),
+                             (120.0, 150.0, "$49.00"), (200.0, 240.0, "Dec")]);
+        let r2 = line(7.0, &[(0.0, 20.0, "512"), (40.0, 90.0, "Seed"),
+                             (120.0, 150.0, "$68.00"), (200.0, 240.0, "Feb")]);
+        let r3 = line(7.0, &[(0.0, 20.0, "500"), (40.0, 90.0, "Northwind"),
+                             (120.0, 150.0, "$41.00")]);
+        let t = build_table(&[&r1, &r2, &r3]).expect("should build a table");
+        assert_eq!(t.rows[2].len(), t.rows[0].len());
+        assert_eq!(t.rows[2].last().map(|s| s.as_str()), Some(""));
+        assert_eq!(t.rows[0].last().map(|s| s.as_str()), Some("Dec"));
+    }
+}
