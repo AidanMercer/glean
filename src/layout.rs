@@ -371,6 +371,90 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
         }
         grid.push(cells);
     }
+    // A column that carries a header and no data at all is a label stranded by
+    // a corridor: its values are in the column beside it. Send the label there
+    // rather than leaving a phantom column and an unlabelled one.
+    if grid.len() > 2 {
+        let mut c = 0;
+        while c < grid[0].len() && grid[0].len() > 1 {
+            let empty_body = grid
+                .iter()
+                .skip(1)
+                .all(|r| r.get(c).is_none_or(|v| v.trim().is_empty()));
+            let label = grid[0].get(c).map(|v| v.trim().to_string()).unwrap_or_default();
+            if empty_body && !label.is_empty() && c + 1 < grid[0].len() {
+                let next = grid[0][c + 1].trim().to_string();
+                grid[0][c + 1] = if next.is_empty() { label } else { format!("{label} {next}") };
+                for r in grid.iter_mut() {
+                    if c < r.len() {
+                        r.remove(c);
+                    }
+                }
+            } else if empty_body && label.is_empty() {
+                for r in grid.iter_mut() {
+                    if c < r.len() {
+                        r.remove(c);
+                    }
+                }
+            } else {
+                c += 1;
+            }
+        }
+    }
+
+    // A single source column can be split by a spurious corridor. A rent roll's
+    // "Expiry" column carries right-aligned dates AND left-aligned phrases
+    // ("5Y Term starting after vacating"); on the rows that hold only a date,
+    // the left half is blank, and that blank runs deep enough to read as a
+    // column boundary. The label then sits one column left of its own data, so
+    // a model pulling fields out reads the expiry date as the floor area.
+    //
+    // The tell is that the two halves are essentially never both filled on the
+    // same row. Tolerate a few — a "Head Lease" row legitimately carries a term
+    // phrase beside an N/A — but not a majority.
+    let mut c = 0;
+    while c + 1 < grid.first().map(|r| r.len()).unwrap_or(0) {
+        let has_hdr = grid.len() > 2;
+        let skip = usize::from(has_hdr);
+        let filled = |r: &Vec<String>, i: usize| r.get(i).is_some_and(|v| !v.trim().is_empty());
+        let n = grid.len() - skip;
+        let both = grid.iter().skip(skip).filter(|r| filled(r, c) && filled(r, c + 1)).count();
+        let left = grid.iter().skip(skip).filter(|r| filled(r, c)).count();
+        let right = grid.iter().skip(skip).filter(|r| filled(r, c + 1)).count();
+
+        if left > 0 && right > 0 && both * 10 <= n {
+            // Both header cells named something. The first names the column
+            // being merged; the second belongs to the column after it, which is
+            // where its data actually sits.
+            let mut displaced: Option<String> = None;
+            for (ri, r) in grid.iter_mut().enumerate() {
+                if c + 1 >= r.len() {
+                    continue;
+                }
+                let a = r[c].trim().to_string();
+                let b = r[c + 1].trim().to_string();
+                if ri == 0 && has_hdr && !a.is_empty() && !b.is_empty() {
+                    displaced = Some(b);
+                    r[c + 1] = a;
+                } else {
+                    r[c + 1] = match (a.is_empty(), b.is_empty()) {
+                        (true, _) => b,
+                        (_, true) => a,
+                        _ => format!("{a} {b}"),
+                    };
+                }
+                r.remove(c);
+            }
+            if let Some(d) = displaced {
+                if let Some(h) = grid.first_mut().and_then(|r| r.get_mut(c + 1)) {
+                    *h = if h.trim().is_empty() { d } else { format!("{d} {}", h.trim()) };
+                }
+            }
+        } else {
+            c += 1;
+        }
+    }
+
     // Accounting layout puts the currency symbol in its own cell, left-aligned
     // against a right-aligned figure, so a corridor opens between them and "$"
     // becomes a column of its own: `| $ | 20.08 |`. Fold any column whose every
@@ -657,6 +741,34 @@ mod tests {
             body.iter().any(|r| r.iter().any(|c| c.trim() == "$20.08")),
             "expected $20.08, got {body:?}"
         );
+    }
+
+    #[test]
+    fn a_split_column_rejoins_and_takes_its_label_with_it() {
+        // The rent-roll case, to scale: "Expiry" is left-aligned at the start of
+        // a wide column whose dates are right-aligned at its end, so a blank
+        // corridor opens between them. Left split, the label sits one column
+        // away from its own data.
+        let g = grid(8.0, &[
+            vec![(0.0, 30.0, "Unit"), (255.0, 274.0, "Expiry"),
+                 (450.0, 470.0, "Size"), (520.0, 550.0, "Base")],
+            vec![(0.0, 30.0, "2-280"), (380.0, 420.0, "12/31/2026"),
+                 (452.0, 470.0, "718"), (520.0, 550.0, "20.08")],
+            vec![(0.0, 30.0, "1-382"), (380.0, 420.0, "5/31/2026"),
+                 (450.0, 470.0, "1,615"), (520.0, 550.0, "25.37")],
+            vec![(0.0, 30.0, "1-374"), (380.0, 420.0, "9/30/2026"),
+                 (450.0, 470.0, "1,719"), (520.0, 550.0, "40.05")],
+        ]);
+        let hdr = &g[0];
+        let row = &g[1];
+        let expiry = hdr.iter().position(|h| h.contains("Expiry")).expect("Expiry header");
+        assert_eq!(
+            row[expiry].trim(),
+            "12/31/2026",
+            "the expiry date must sit under the Expiry label, got {g:?}"
+        );
+        let size = hdr.iter().position(|h| h.contains("Size")).expect("Size header");
+        assert_eq!(row[size].trim(), "718", "size must sit under Size, got {g:?}");
     }
 
     #[test]
