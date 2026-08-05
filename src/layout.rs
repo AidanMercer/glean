@@ -655,7 +655,11 @@ mod tests {
 /// ordinary content on page 1 and is only revealed as chrome by appearing on
 /// all 59. Requiring a consistent margin position keeps a genuinely repeated
 /// body sentence (a defined term, a recurring clause) out of the set.
-pub fn running_chrome(pages: &[(Vec<Line>, f64)], min_pages: usize) -> std::collections::HashSet<String> {
+pub fn running_chrome(
+    pages: &[(Vec<Line>, f64)],
+    min_pages: usize,
+    body: f64,
+) -> std::collections::HashSet<String> {
     use std::collections::HashMap;
     let mut seen: HashMap<String, Vec<f64>> = HashMap::new();
     for (lines, page_h) in pages {
@@ -664,8 +668,16 @@ pub fn running_chrome(pages: &[(Vec<Line>, f64)], min_pages: usize) -> std::coll
         }
         for l in lines {
             let rel = l.y / page_h;
-            if (0.10..=0.90).contains(&rel) {
+            if (0.08..=0.92).contains(&rel) {
                 continue; // only the margins can hold chrome
+            }
+            // Chrome is never set larger than body text; a section heading at the
+            // top of a page sits in the same band and is NOT chrome. Without this
+            // guard "## Appendix A", a photo caption, and the title of a short
+            // agreement all get deleted — silent data loss, which is far worse
+            // than the boilerplate it was trying to remove.
+            if body > 0.0 && l.size > body * 1.02 {
+                continue;
             }
             let t = l.text().trim().to_string();
             if t.chars().count() < 8 {

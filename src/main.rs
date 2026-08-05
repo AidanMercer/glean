@@ -211,7 +211,14 @@ fn main() -> ExitCode {
         // carry a different one, or none. An eighth of the document is enough
         // evidence when combined with the margin and same-band requirements,
         // which body text essentially never satisfies.
-        layout::running_chrome(&pages, (wanted.len() / 8).max(4))
+        // Document-level body size: a per-page estimate is dragged around by
+        // whatever that page happens to contain.
+        let mut sizes: Vec<f64> = pages
+            .iter()
+            .flat_map(|(ls, _)| ls.iter().map(|l| l.size))
+            .collect();
+        let body = layout::median(&mut sizes);
+        layout::running_chrome(&pages, (wanted.len() / 4).max(5), body)
     };
 
     // Phase 2: serialise, dropping the chrome.
