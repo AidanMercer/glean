@@ -22,9 +22,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src/shim.cpp");
 
     let mut build = cc::Build::new();
-    build.cpp(true).file("src/shim.cpp").flag_if_supported("-std=c++17").opt_level(3);
+    build.cpp(true).file("src/shim.cpp").file("src/images.cpp").flag_if_supported("-std=c++20").opt_level(3);
 
-    for f in pkg_config(&["--cflags", "poppler-cpp"]) {
+    for f in pkg_config(&["--cflags", "poppler-cpp", "poppler", "zlib"]) {
         if let Some(inc) = f.strip_prefix("-I") {
             build.include(inc);
         } else {
@@ -33,7 +33,9 @@ fn main() {
     }
     build.compile("gleanshim");
 
-    for f in pkg_config(&["--libs", "poppler-cpp"]) {
+    // images.cpp uses poppler's core OutputDev, which pkg-config exposes as
+    // `poppler` (poppler-cpp is only the stable wrapper), plus zlib for PNG.
+    for f in pkg_config(&["--libs", "poppler-cpp", "poppler", "zlib"]) {
         if let Some(l) = f.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={l}");
         } else if let Some(p) = f.strip_prefix("-L") {

@@ -4,6 +4,7 @@
 //! layout, table reconstruction and serialisation are Rust.
 
 mod ffi;
+mod imgffi;
 mod layout;
 mod md;
 
@@ -20,6 +21,9 @@ Options:
   -o, --output <path>   write Markdown to <path> instead of stdout
   -p, --pages <spec>    only these pages, 1-based (e.g. 3, 5-9, 2,7,11-14)
   -j, --jobs <n>        worker threads (default: available parallelism)
+      --json            emit {pages:[{page,anchor,markdown}], full_markdown}
+      --images <dir>    extract embedded images to <dir> as PNG
+      --min-image <px>  smallest image side to keep (default 64)
       --stats           print page/word/table counts to stderr
   -h, --help            print this help
   -V, --version         print the version
@@ -34,6 +38,9 @@ struct Args {
     pages: Option<Vec<usize>>,
     jobs: usize,
     stats: bool,
+    json: bool,
+    images: Option<String>,
+    min_image: u32,
 }
 
 fn parse_pages(spec: &str) -> Option<Vec<usize>> {
@@ -75,6 +82,9 @@ fn parse_args() -> Result<Args, String> {
         pages: None,
         jobs: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
         stats: false,
+        json: false,
+        images: None,
+        min_image: 64,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -88,6 +98,12 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "--stats" => a.stats = true,
+            "--json" => a.json = true,
+            "--images" => a.images = Some(it.next().ok_or("--images needs a directory")?),
+            "--min-image" => {
+                let s = it.next().ok_or("--min-image needs a number")?;
+                a.min_image = s.parse().map_err(|_| format!("bad pixel size: {s}"))?;
+            }
             "-o" | "--output" => a.output = Some(it.next().ok_or("-o needs a path")?),
             "-p" | "--pages" => {
                 let s = it.next().ok_or("-p needs a page spec")?;
@@ -189,12 +205,34 @@ fn main() -> ExitCode {
         }
     }
 
-    let joined = out
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    // Images are extracted once for the whole document: the C++ side walks the
+    // pages itself, and poppler's global params are not safe to race on.
+    let mut images: Vec<imgffi::Image> = Vec::new();
+    if let Some(dir) = &args.images {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("glean: cannot create {dir}: {e}");
+            return ExitCode::from(1);
+        }
+        let first = wanted.first().map(|p| p + 1).unwrap_or(1);
+        let last = wanted.last().map(|p| p + 1).unwrap_or(0);
+        match imgffi::extract(&args.input, dir, first, last, args.min_image) {
+            Ok(v) => images = v,
+            Err(e) => {
+                eprintln!("glean: image extraction failed: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    let joined = if args.json {
+        render_json(&args, &wanted, &out, &doc, &images)
+    } else {
+        out.iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
 
     let res = match &args.output {
         Some(p) => std::fs::write(p, joined.as_bytes()).map_err(|e| e.to_string()),
@@ -212,6 +250,10 @@ fn main() -> ExitCode {
     }
 
     if args.stats {
+        if !images.is_empty() {
+            eprintln!("glean: extracted {} image(s) to {}", images.len(),
+                args.images.as_deref().unwrap_or("."));
+        }
         eprintln!(
             "glean: {} pages, {words} words, {tables} tables, {empty} page(s) with no text layer",
             wanted.len()
@@ -263,4 +305,70 @@ fn render_page(doc: &ffi::Doc, page: usize) -> (String, (usize, usize)) {
         }
     }
     (s, (n, ntab))
+}
+
+/// JSON escape, sufficient for the subset we emit.
+fn jesc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// Page-addressable output. The shape mirrors what a hosted OCR API returns —
+/// `pages[]` with an anchor each, plus the concatenated document — so a pipeline
+/// written against one can consume the other with no translation layer.
+fn render_json(
+    args: &Args,
+    wanted: &[usize],
+    out: &[String],
+    doc: &ffi::Doc,
+    images: &[imgffi::Image],
+) -> String {
+    let mut s = String::from("{\n  \"pages\": [\n");
+    for (slot, &p) in wanted.iter().enumerate() {
+        let md = out[slot].trim();
+        let (w, h) = doc.page_size(p);
+        let imgs: Vec<&imgffi::Image> = images.iter().filter(|i| i.page == p + 1).collect();
+        s.push_str(&format!(
+            "    {{\"page\": {}, \"anchor\": \"page-{}\", \"width\": {:.1}, \"height\": {:.1}, \"has_text\": {}, \"markdown\": \"{}\"",
+            p + 1, p + 1, w, h, !md.is_empty(), jesc(md)
+        ));
+        if !imgs.is_empty() {
+            s.push_str(", \"images\": [");
+            for (k, i) in imgs.iter().enumerate() {
+                if k > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&format!(
+                    "{{\"path\": \"{}\", \"width\": {}, \"height\": {}, \"bbox\": [{:.1}, {:.1}, {:.1}, {:.1}], \"page_fraction\": {:.3}}}",
+                    jesc(&i.path), i.w, i.h, i.x0, i.y0, i.x1, i.y1, i.page_fraction(w, h)
+                ));
+            }
+            s.push(']');
+        }
+        s.push('}');
+        if slot + 1 < wanted.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    let full: Vec<&str> = out.iter().map(|x| x.trim()).filter(|x| !x.is_empty()).collect();
+    s.push_str(&format!(
+        "  ],\n  \"full_markdown\": \"{}\",\n  \"meta\": {{\"source\": \"{}\", \"pages\": {}, \"images\": {}}}\n}}",
+        jesc(&full.join("\n\n")),
+        jesc(&args.input),
+        wanted.len(),
+        images.len()
+    ));
+    s
 }

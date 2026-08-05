@@ -97,23 +97,51 @@ pub fn lines(mut words: Vec<Word>) -> Vec<Line> {
 /// closer than a fraction of an em is not a word break.
 fn merge_tracking(ws: Vec<Word>) -> Vec<Word> {
     let mut out: Vec<Word> = Vec::with_capacity(ws.len());
-    for w in ws {
-        let join = out.last().is_some_and(|p: &Word| {
-            let gap = w.x0 - p.x1;
+    let mut i = 0;
+    while i < ws.len() {
+        // Collect a run of pieces separated by sub-tracking gaps. A real
+        // inter-word space is ~0.25em in most faces; tracking gaps land well
+        // below that, and are often negative.
+        let mut j = i + 1;
+        while j < ws.len() {
+            let (p, w) = (&ws[j - 1], &ws[j]);
             let em = p.size.max(w.size).max(1.0);
-            // A real inter-word space is ~0.25em in most faces; tracking gaps
-            // inside a word land well below that, and are often negative.
-            gap < em * 0.16 && (w.ymid() - p.ymid()).abs() < em * 0.4
-        });
-        if join {
-            let p = out.last_mut().unwrap();
-            p.text.push_str(&w.text);
-            p.x1 = w.x1;
-            p.y0 = p.y0.min(w.y0);
-            p.y1 = p.y1.max(w.y1);
-        } else {
-            out.push(w);
+            let gap = w.x0 - p.x1;
+            if gap < em * 0.16 && (w.ymid() - p.ymid()).abs() < em * 0.4 {
+                j += 1;
+            } else {
+                break;
+            }
         }
+
+        // Decide on the RUN, not on each pair. Letter-spacing shatters a word
+        // into three or more pieces ("O|ffic|e"); a run of exactly two is nearly
+        // always two genuine neighbours whose cells happen to nearly touch — a
+        // right-aligned "$318" against a left-aligned "12", or "Wholesale" beside
+        // "Trade" — and merging those corrupts data rather than repairing it.
+        // Two pieces may still join when both are themselves sub-word fragments.
+        let n = j - i;
+        let piece = |w: &Word| w.text.chars().count() <= 2;
+        // A numeric piece is never a tracking fragment worth joining blind: that
+        // is how "$318" beside "12" became "$31812". Letters may join on a single
+        // stub ("Tota"+"l"), which tracking produces constantly.
+        let numeric = ws[i..j]
+            .iter()
+            .any(|w| w.text.chars().any(|c| c.is_ascii_digit() || c == '$'));
+        let two_ok = ws[i..j].iter().any(piece) && !numeric;
+        if n >= 3 || (n == 2 && two_ok) {
+            let mut m = ws[i].clone();
+            for w in &ws[i + 1..j] {
+                m.text.push_str(&w.text);
+                m.x1 = w.x1;
+                m.y0 = m.y0.min(w.y0);
+                m.y1 = m.y1.max(w.y1);
+            }
+            out.push(m);
+        } else {
+            out.extend_from_slice(&ws[i..j]);
+        }
+        i = j;
     }
     out
 }
@@ -459,6 +487,33 @@ mod tests {
         let merged = merge_tracking(ws);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "Office");
+    }
+
+    #[test]
+    fn touching_cells_do_not_weld() {
+        // A right-aligned "$318" almost touching a left-aligned "12" in the next
+        // column. Two pieces, both real values — merging invents "$31812".
+        let ws = line(7.0, &[(400.0, 418.0, "$318"), (418.6, 428.0, "12")]).words;
+        let m = merge_tracking(ws);
+        assert_eq!(m.len(), 2, "adjacent cells must not weld");
+        assert_eq!(m[0].text, "$318");
+    }
+
+    #[test]
+    fn adjacent_words_do_not_weld() {
+        // "Wholesale Trade" set tight in a table label.
+        let ws = line(8.0, &[(0.0, 44.0, "Wholesale"), (44.7, 70.0, "Trade")]).words;
+        assert_eq!(merge_tracking(ws).len(), 2, "two real words must not weld");
+    }
+
+    #[test]
+    fn two_piece_letter_split_still_joins() {
+        // "Tota l" — tracking leaves a one-letter stub. Letters may join on a
+        // single stub; digits may not.
+        let ws = line(7.0, &[(0.0, 22.0, "Tota"), (22.5, 26.0, "l")]).words;
+        let m = merge_tracking(ws);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].text, "Total");
     }
 
     #[test]

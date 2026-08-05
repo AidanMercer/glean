@@ -39,7 +39,9 @@ engine tested.
 
 ## Install
 
-Needs poppler with development headers (`poppler-cpp`), a C++17 compiler, and Rust.
+Needs poppler with development headers, a C++20 compiler, zlib, and Rust.
+Image extraction uses poppler's core `OutputDev`, so the private headers are
+required too — the `poppler` package ships them on Arch.
 
 ```sh
 sudo pacman -S poppler          # Arch; libpoppler-cpp-dev on Debian/Ubuntu
@@ -49,11 +51,43 @@ cargo build --release
 ## Use
 
 ```sh
-glean report.pdf                    # Markdown to stdout
-glean report.pdf -o report.md       # or to a file
-glean report.pdf -p 32,74 -j 8      # only these pages, 8 threads
-glean report.pdf --stats            # page/word/table counts to stderr
+glean report.pdf                     # Markdown to stdout
+glean report.pdf -o report.md        # or to a file
+glean report.pdf -p 32,74 -j 8       # only these pages, 8 threads
+glean report.pdf --json              # page-addressable JSON
+glean report.pdf --images ./figs     # extract embedded images as PNG
+glean report.pdf --stats             # page/word/table counts to stderr
 ```
+
+### Page-addressable output
+
+`--json` emits one record per page, deliberately shaped like a hosted OCR API's
+response so a pipeline written against one can consume the other unchanged:
+
+```json
+{
+  "pages": [
+    {"page": 1, "anchor": "page-1", "width": 720.0, "height": 540.0,
+     "has_text": true, "markdown": "# ...",
+     "images": [{"path": "figs/p001-03.png", "width": 1033, "height": 738,
+                 "bbox": [284.4, 209.6, 679.4, 491.7], "page_fraction": 0.287}]}
+  ],
+  "full_markdown": "...",
+  "meta": {"source": "report.pdf", "pages": 10, "images": 29}
+}
+```
+
+`has_text` is the field to route on. A page with `has_text: false` carrying one
+image at `page_fraction: 1.0` is a scan — send that page to OCR. Nothing else in
+the output distinguishes it, which is exactly the silent-truncation trap.
+
+### Images
+
+`--images DIR` writes every embedded image as 8-bit RGB PNG, whatever the source
+encoding, and records where it sat on the page. `page_fraction` separates a
+figure from a scan backdrop; `--min-image` (default 64px) drops rules and
+spacers. Without the flag no images are written and the Markdown carries no image
+noise.
 
 ## How it works
 
@@ -105,7 +139,9 @@ document: process the text pages, silently drop 42 scanned ones, and exit 0. For
 the ESA in the test corpus those 42 pages held the historical contamination
 evidence. Route them to an OCR engine; glean will not pretend they were not there.
 
-No formulas, no image extraction, no reading of embedded attachments.
+No formulas, no reading of embedded attachments. `--images` extracts embedded
+rasters, but a vector chart drawn with path operators is not an image and will
+not be captured.
 
 ## Tests
 
@@ -113,5 +149,7 @@ No formulas, no image extraction, no reading of embedded attachments.
 cargo test
 ```
 
-Six tests pin the layout heuristics: tracking repair, word-break preservation,
-justified prose vs. cell rows, spanning headers, and empty-cell column stability.
+Ten tests pin the layout heuristics: tracking repair and its two failure
+directions (a two-piece letter split must join; two touching cells and two real
+words must not), justified prose vs. cell rows, two-column statements, spanning
+headers, and empty-cell column stability.
