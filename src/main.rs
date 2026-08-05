@@ -24,6 +24,8 @@ Options:
       --json            emit {pages:[{page,anchor,markdown}], full_markdown}
       --images <dir>    extract embedded images to <dir> as PNG
       --min-image <px>  smallest image side to keep (default 64)
+      --figures         also rasterise vector-drawn charts (needs --images)
+      --keep-chrome     keep running heads/footers (dropped by default)
       --stats           print page/word/table counts to stderr
   -h, --help            print this help
   -V, --version         print the version
@@ -38,9 +40,11 @@ struct Args {
     pages: Option<Vec<usize>>,
     jobs: usize,
     stats: bool,
+    keep_chrome: bool,
     json: bool,
     images: Option<String>,
     min_image: u32,
+    figures: bool,
 }
 
 fn parse_pages(spec: &str) -> Option<Vec<usize>> {
@@ -82,9 +86,11 @@ fn parse_args() -> Result<Args, String> {
         pages: None,
         jobs: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
         stats: false,
+        keep_chrome: false,
         json: false,
         images: None,
         min_image: 64,
+        figures: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -98,7 +104,9 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "--stats" => a.stats = true,
+            "--keep-chrome" => a.keep_chrome = true,
             "--json" => a.json = true,
+            "--figures" => a.figures = true,
             "--images" => a.images = Some(it.next().ok_or("--images needs a directory")?),
             "--min-image" => {
                 let s = it.next().ok_or("--min-image needs a number")?;
@@ -156,25 +164,18 @@ fn main() -> ExitCode {
     }
 
     let nthreads = args.jobs.min(wanted.len());
-    let mut out: Vec<String> = vec![String::new(); wanted.len()];
-    let (mut empty, mut tables, mut words) = (0usize, 0usize, 0usize);
 
-    if nthreads <= 1 {
+    // Phase 1: extract every page's lines. Serialisation is deferred because
+    // running heads and footers can only be identified by looking across pages —
+    // nothing about `Docusign Envelope ID: …` marks it as chrome until you see
+    // it on all 59. Pages are independent here, so this fans out; each worker
+    // opens its own handle, poppler's document not being thread-safe.
+    let mut pages: Vec<(Vec<layout::Line>, f64)> = vec![(Vec::new(), 0.0); wanted.len()];
+    let mut widths: Vec<f64> = vec![0.0; wanted.len()];
+    {
+        let mut chunks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nthreads.max(1)];
         for (slot, &p) in wanted.iter().enumerate() {
-            let (t, s) = render_page(&doc, p);
-            words += s.0;
-            tables += s.1;
-            if s.0 == 0 {
-                empty += 1;
-            }
-            out[slot] = t;
-        }
-    } else {
-        // Pages are independent, so fan them out and reassemble in order. Each
-        // worker opens its own handle: poppler's document is not thread-safe.
-        let mut chunks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nthreads];
-        for (slot, &p) in wanted.iter().enumerate() {
-            chunks[slot % nthreads].push((slot, p));
+            chunks[slot % nthreads.max(1)].push((slot, p));
         }
         let path = args.input.as_str();
         let results = std::thread::scope(|sc| {
@@ -185,8 +186,8 @@ fn main() -> ExitCode {
                         Ok(d) => ch
                             .into_iter()
                             .map(|(slot, p)| {
-                                let (t, s) = render_page(&d, p);
-                                (slot, t, s)
+                                let (pw, ph) = d.page_size(p);
+                                (slot, layout::lines(d.words(p)), pw, ph)
                             })
                             .collect::<Vec<_>>(),
                         Err(_) => Vec::new(),
@@ -195,14 +196,35 @@ fn main() -> ExitCode {
                 .collect();
             hs.into_iter().filter_map(|h| h.join().ok()).flatten().collect::<Vec<_>>()
         });
-        for (slot, text, s) in results {
-            words += s.0;
-            tables += s.1;
-            if s.0 == 0 {
-                empty += 1;
-            }
-            out[slot] = text;
+        for (slot, lines, pw, ph) in results {
+            pages[slot] = (lines, ph);
+            widths[slot] = pw;
         }
+    }
+
+    // A single page has no "across pages" to compare against, and two is not
+    // evidence either; below that threshold nothing is suppressed.
+    let chrome = if args.keep_chrome || wanted.len() < 4 {
+        std::collections::HashSet::new()
+    } else {
+        // A running head need not be on every page — a report's appendices often
+        // carry a different one, or none. An eighth of the document is enough
+        // evidence when combined with the margin and same-band requirements,
+        // which body text essentially never satisfies.
+        layout::running_chrome(&pages, (wanted.len() / 8).max(4))
+    };
+
+    // Phase 2: serialise, dropping the chrome.
+    let mut out: Vec<String> = vec![String::new(); wanted.len()];
+    let (mut empty, mut tables, mut words) = (0usize, 0usize, 0usize);
+    for (slot, (lines, ph)) in pages.iter().enumerate() {
+        let (t, s) = render_lines(lines, widths[slot], *ph, &chrome);
+        words += s.0;
+        tables += s.1;
+        if s.0 == 0 {
+            empty += 1;
+        }
+        out[slot] = t;
     }
 
     // Images are extracted once for the whole document: the C++ side walks the
@@ -215,7 +237,8 @@ fn main() -> ExitCode {
         }
         let first = wanted.first().map(|p| p + 1).unwrap_or(1);
         let last = wanted.last().map(|p| p + 1).unwrap_or(0);
-        match imgffi::extract(&args.input, dir, first, last, args.min_image) {
+        let figs = if args.figures { Some((72.0, 150.0)) } else { None };
+        match imgffi::extract_all(&args.input, dir, first, last, args.min_image, figs) {
             Ok(v) => images = v,
             Err(e) => {
                 eprintln!("glean: image extraction failed: {e}");
@@ -273,31 +296,34 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Returns the page's markdown plus (word count, table count).
-fn render_page(doc: &ffi::Doc, page: usize) -> (String, (usize, usize)) {
-    let words = doc.words(page);
-    let n = words.len();
+/// Serialise one page's lines, dropping any that were identified as running
+/// chrome. Returns the markdown plus (word count, table count).
+fn render_lines(
+    lines: &[layout::Line],
+    page_w: f64,
+    page_h: f64,
+    chrome: &std::collections::HashSet<String>,
+) -> (String, (usize, usize)) {
+    let kept: Vec<layout::Line> = if chrome.is_empty() {
+        lines.to_vec()
+    } else {
+        lines
+            .iter()
+            .filter(|l| !chrome.contains(l.text().trim()))
+            .cloned()
+            .collect()
+    };
+    let n: usize = kept.iter().map(|l| l.words.len()).sum();
     if n == 0 {
         return (String::new(), (0, 0));
     }
-    let (pw, ph) = doc.page_size(page);
-    let lines = layout::lines(words);
-    if std::env::var_os("GLEAN_DEBUG_LINES").is_some() {
-        for l in &lines {
-            let gaps: Vec<String> = l.words.windows(2)
-                .map(|w| format!("{:.1}", w[1].x0 - w[0].x1)).collect();
-            eprintln!("[line y={:6.1} size={:4.1} n={} gaps=[{}] em3={:.1}] {}",
-                l.y, l.size, l.words.len(), gaps.join(","), l.size * 3.0,
-                l.text().chars().take(70).collect::<String>());
-        }
-    }
-    let body = layout::body_size(&lines);
+    let body = layout::body_size(&kept);
 
     let mut s = String::new();
     let mut ntab = 0;
-    for col in layout::columns(&lines, pw.max(1.0)) {
-        let sub: Vec<layout::Line> = col.into_iter().map(|i| lines[i].clone()).collect();
-        for b in layout::blocks(&sub, body, ph.max(1.0)) {
+    for col in layout::columns(&kept, page_w.max(1.0)) {
+        let sub: Vec<layout::Line> = col.into_iter().map(|i| kept[i].clone()).collect();
+        for b in layout::blocks(&sub, body, page_h.max(1.0)) {
             if matches!(b, layout::Block::Table(_)) {
                 ntab += 1;
             }

@@ -29,6 +29,15 @@ extern "C" {
     fn glean_images_count(g: *mut GImages) -> c_int;
     fn glean_images_data(g: *mut GImages) -> *const GImage;
     fn glean_images_free(g: *mut GImages);
+    fn glean_figures(
+        pdf: *const c_char,
+        outdir: *const c_char,
+        first: c_int,
+        last: c_int,
+        min_side_pts: c_double,
+        dpi: c_double,
+        into: *mut GImages,
+    ) -> c_int;
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +64,51 @@ impl Image {
     }
 }
 
-/// Extract every embedded image at least `min_px` on a side into `outdir`.
+/// Extract embedded rasters, and optionally rasterise vector-drawn figures too.
+///
+/// A chart built from path operators is not an image and never reaches
+/// `drawImage`, so it has to be found by where ink lands and then re-rendered.
+pub fn extract_all(
+    pdf: &str,
+    outdir: &str,
+    first: usize,
+    last: usize,
+    min_px: u32,
+    figures: Option<(f64, f64)>,
+) -> Result<Vec<Image>, String> {
+    let p = CString::new(pdf).map_err(|e| e.to_string())?;
+    let d = CString::new(outdir).map_err(|e| e.to_string())?;
+    let g = unsafe { glean_images(p.as_ptr(), d.as_ptr(), first as c_int, last as c_int, min_px as c_int) };
+    if g.is_null() {
+        return Err(format!("could not open {pdf} for image extraction"));
+    }
+    if let Some((min_side, dpi)) = figures {
+        unsafe {
+            glean_figures(p.as_ptr(), d.as_ptr(), first as c_int, last as c_int, min_side, dpi, g)
+        };
+    }
+    let n = unsafe { glean_images_count(g) } as usize;
+    let mut out = Vec::with_capacity(n);
+    if n > 0 {
+        let data = unsafe { std::slice::from_raw_parts(glean_images_data(g), n) };
+        for i in data {
+            out.push(Image {
+                page: i.page as usize,
+                x0: i.x0,
+                y0: i.y0,
+                x1: i.x1,
+                y1: i.y1,
+                w: i.w as u32,
+                h: i.h as u32,
+                path: unsafe { CStr::from_ptr(i.path) }.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    unsafe { glean_images_free(g) };
+    Ok(out)
+}
+
+#[allow(dead_code)]
 pub fn extract(pdf: &str, outdir: &str, first: usize, last: usize, min_px: u32) -> Result<Vec<Image>, String> {
     let p = CString::new(pdf).map_err(|e| e.to_string())?;
     let d = CString::new(outdir).map_err(|e| e.to_string())?;

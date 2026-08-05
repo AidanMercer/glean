@@ -124,11 +124,25 @@ const char *glean_arena(GDoc *g, int idx, int *len)
     return g->pages[idx].arena.data();
 }
 
+// Page dimensions independently of text extraction. Reading them off a loaded
+// page only works if that page happens to have been loaded already — and it
+// silently yields zero if not, which is the kind of failure that turns into a
+// margin test that never matches. Fetch the rect on demand instead; it costs a
+// page construction, not a text pass.
 void glean_page_size(GDoc *g, int idx, double *w, double *h)
 {
     if (!g || idx < 0 || idx >= (int)g->pages.size()) { *w = *h = 0; return; }
-    *w = g->pages[idx].width;
-    *h = g->pages[idx].height;
+    GPage &gp = g->pages[idx];
+    if (gp.width <= 0.0 || gp.height <= 0.0) {
+        std::unique_ptr<poppler::page> p(g->doc->create_page(idx));
+        if (p) {
+            poppler::rectf r = p->page_rect();
+            gp.width = r.width();
+            gp.height = r.height();
+        }
+    }
+    *w = gp.width;
+    *h = gp.height;
 }
 
 // Free a page's buffers once Rust has consumed it, so peak memory stays flat

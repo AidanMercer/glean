@@ -19,7 +19,11 @@ fn pkg_config(args: &[&str]) -> Vec<String> {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=src/shim.cpp");
+    // Every C++ source must be listed: cargo will not re-run this script for a
+    // file it was not told about, and the stale object links silently.
+    for f in ["src/shim.cpp", "src/images.cpp", "build.rs"] {
+        println!("cargo:rerun-if-changed={f}");
+    }
 
     let mut build = cc::Build::new();
     build.cpp(true).file("src/shim.cpp").file("src/images.cpp").flag_if_supported("-std=c++20").opt_level(3);

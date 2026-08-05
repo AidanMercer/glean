@@ -56,6 +56,8 @@ glean report.pdf -o report.md        # or to a file
 glean report.pdf -p 32,74 -j 8       # only these pages, 8 threads
 glean report.pdf --json              # page-addressable JSON
 glean report.pdf --images ./figs     # extract embedded images as PNG
+glean report.pdf --images ./figs --figures   # also rasterise vector charts
+glean report.pdf --keep-chrome       # keep running heads/footers
 glean report.pdf --stats             # page/word/table counts to stderr
 ```
 
@@ -84,7 +86,12 @@ the output distinguishes it, which is exactly the silent-truncation trap.
 ### Images
 
 `--images DIR` writes every embedded image as 8-bit RGB PNG, whatever the source
-encoding, and records where it sat on the page. `page_fraction` separates a
+encoding, and records where it sat on the page. Identical pixels are written
+once — a logo repeated on 29 placements becomes one file with 29 recorded
+positions. `--figures` additionally finds charts drawn with path operators
+(which are not images and never reach an image hook), clusters the ink, and
+rasterises those regions at 150 dpi; page-sized clusters are rejected as page
+furniture rather than figures. `page_fraction` separates a
 figure from a scan backdrop; `--min-image` (default 64px) drops rules and
 spacers. Without the flag no images are written and the Markdown carries no image
 noise.
@@ -102,13 +109,22 @@ that is Rust:
    `Office Units` finds it. This is a repair, never a guess — glean only ever
    joins glyphs that are present.
 3. **Columns.** A full-height whitespace gutter splits the page into reading
-   order, rejected if any line straddles it.
-4. **Tables.** Column boundaries come from *vertical whitespace corridors* — x
+   order. A line straddling the gutter — a title, a section heading, a
+   full-width table — is a band boundary, not a disproof: the columns above it
+   are flushed, it is emitted in place, and a fresh band begins.
+4. **Running chrome.** Text repeating in the same margin band across an eighth
+   of the pages is a running head or footer and is dropped (`--keep-chrome`
+   keeps it). This is necessarily a document-level decision: nothing about
+   `Docusign Envelope ID: …` marks it as chrome until you see it on all 59
+   pages. Worth 1.4–3.1% of a long document, and more in retrieval quality —
+   a chunk containing only an envelope ID is noise that still competes for
+   your top-k.
+5. **Tables.** Column boundaries come from *vertical whitespace corridors* — x
    ranges no word crosses on any row of the block. This is the core idea. It
    handles ruled and unruled tables identically, and unlike x-anchor clustering
    it copes with empty cells: a tenant with no renewal option leaves a hole
    rather than shifting every later column left.
-5. **Markdown.** Never emits a ragged table, never welds two cells together.
+6. **Markdown.** Never emits a ragged table, never welds two cells together.
 
 ### Two details that took a while to get right
 
@@ -139,7 +155,9 @@ document: process the text pages, silently drop 42 scanned ones, and exit 0. For
 the ESA in the test corpus those 42 pages held the historical contamination
 evidence. Route them to an OCR engine; glean will not pretend they were not there.
 
-No formulas, no reading of embedded attachments. `--images` extracts embedded
+Vertically merged cells still split a table: where a rent roll runs one set of
+figures across two tenant rows, the second row lands outside the table. No
+formulas, no reading of embedded attachments. `--images` extracts embedded
 rasters, but a vector chart drawn with path operators is not an image and will
 not be captured.
 

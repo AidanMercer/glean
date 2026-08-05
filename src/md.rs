@@ -40,6 +40,26 @@ fn write_table(out: &mut String, t: &Table) {
     }
     let ncol = rows[0].len();
 
+    // A table with no header text and barely any body is a layout accident — an
+    // empty ruled box, or a stray pair of aligned words. Emitting `| | |` puts
+    // pure noise in an LLM's context window.
+    let substantive = rows
+        .iter()
+        .filter(|r| r.iter().filter(|c| !c.trim().is_empty()).count() >= 2)
+        .count();
+    let header_blank = rows[0].iter().all(|c| c.trim().is_empty());
+    if substantive < 2 || (header_blank && substantive < 3) {
+        for r in &rows {
+            let line = r.iter().map(|c| c.trim()).filter(|c| !c.is_empty())
+                .collect::<Vec<_>>().join(" ");
+            if !line.is_empty() {
+                out.push_str(&line);
+                out.push_str("\n\n");
+            }
+        }
+        return;
+    }
+
     let (head, body): (&[Vec<String>], &[Vec<String>]) = if t.header && rows.len() > 1 {
         (&rows[..1], &rows[1..])
     } else {

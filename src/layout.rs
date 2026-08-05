@@ -197,20 +197,46 @@ pub fn columns(lines: &[Line], page_w: f64) -> Vec<Vec<usize>> {
     }
     let split = (s + e) as f64 * 0.5 * bw;
 
+    // A straddling line is not proof that the page is single-column: papers and
+    // reports routinely run a title, a section heading or a full-width table
+    // across both columns. Treat each straddler as a band boundary — flush the
+    // columns above it, emit it in place, then start a fresh band. Bailing out
+    // on the first straddler, as this used to, throws away the whole two-column
+    // reading order because of one heading.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
     let (mut l, mut r) = (Vec::new(), Vec::new());
+    let mut paired = 0usize;
+    let mut flush = |l: &mut Vec<usize>, r: &mut Vec<usize>, g: &mut Vec<Vec<usize>>, paired: &mut usize| {
+        if !l.is_empty() && !r.is_empty() {
+            *paired += 1;
+        }
+        // Order matters: the whole left column of a band precedes the right.
+        if !l.is_empty() {
+            g.push(std::mem::take(l));
+        }
+        if !r.is_empty() {
+            g.push(std::mem::take(r));
+        }
+    };
     for (i, ln) in lines.iter().enumerate() {
         if ln.x1 <= split {
             l.push(i);
         } else if ln.x0 >= split {
             r.push(i);
         } else {
-            return single; // a line straddles the gutter: not really two columns
+            flush(&mut l, &mut r, &mut groups, &mut paired);
+            groups.push(vec![i]);
         }
     }
-    if l.len() < 4 || r.len() < 4 {
+    flush(&mut l, &mut r, &mut groups, &mut paired);
+
+    // Only claim a two-column page if some band actually had both columns
+    // populated; otherwise this is one column with a ragged right edge.
+    let total: usize = groups.iter().map(|g| g.len()).sum();
+    if paired == 0 || total < 8 {
         return single;
     }
-    vec![l, r]
+    groups
 }
 
 /// A line looks tabular when it contains internal gaps far wider than *its own*
@@ -345,6 +371,37 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
         }
         grid.push(cells);
     }
+    // Accounting layout puts the currency symbol in its own cell, left-aligned
+    // against a right-aligned figure, so a corridor opens between them and "$"
+    // becomes a column of its own: `| $ | 20.08 |`. Fold any column whose every
+    // entry is a bare symbol into the one after it.
+    let ncols = grid.first().map(|r| r.len()).unwrap_or(0);
+    let mut c = 0;
+    while c + 1 < grid.first().map(|r| r.len()).unwrap_or(0) {
+        // Judge on the body only: the header cell above a "$" column holds the
+        // measure's name ("Base", "Year"), which would otherwise disqualify it.
+        let skip = usize::from(grid.len() > 2);
+        let entries: Vec<&String> = grid.iter().skip(skip).filter_map(|r| r.get(c)).collect();
+        let symbolic = entries.iter().any(|v| !v.trim().is_empty())
+            && entries
+                .iter()
+                .all(|v| matches!(v.trim(), "" | "$" | "-" | "—" | "(" | ")"));
+        if symbolic {
+            for r in grid.iter_mut() {
+                let sym = r[c].trim().to_string();
+                if !sym.is_empty() && !r[c + 1].trim().is_empty() {
+                    r[c + 1] = format!("{sym}{}", r[c + 1].trim());
+                } else if !sym.is_empty() {
+                    r[c + 1] = sym;
+                }
+                r.remove(c);
+            }
+        } else {
+            c += 1;
+        }
+    }
+    let _ = ncols;
+
     // A table whose rows are nearly all single-cell is really prose. Count rows,
     // not cells: a statement's section labels ("Income", "Cost of Goods Sold")
     // each occupy one cell legitimately, and summing cells lets a handful of them
@@ -588,4 +645,57 @@ mod tests {
         assert_eq!(t.rows[2].last().map(|s| s.as_str()), Some(""));
         assert_eq!(t.rows[0].last().map(|s| s.as_str()), Some("Dec"));
     }
+}
+
+/// Text that repeats in the same margin position across most pages: a running
+/// head, a footer, a template stamp, a DocuSign envelope id.
+///
+/// This has to be a document-level decision. Nothing about the line in
+/// isolation says "boilerplate" — `Docusign Envelope ID: 4808F9DA…` looks like
+/// ordinary content on page 1 and is only revealed as chrome by appearing on
+/// all 59. Requiring a consistent margin position keeps a genuinely repeated
+/// body sentence (a defined term, a recurring clause) out of the set.
+pub fn running_chrome(pages: &[(Vec<Line>, f64)], min_pages: usize) -> std::collections::HashSet<String> {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, Vec<f64>> = HashMap::new();
+    for (lines, page_h) in pages {
+        if *page_h <= 0.0 {
+            continue;
+        }
+        for l in lines {
+            let rel = l.y / page_h;
+            if !(rel < 0.10 || rel > 0.90) {
+                continue; // only the margins can hold chrome
+            }
+            let t = l.text().trim().to_string();
+            if t.chars().count() < 8 {
+                continue;
+            }
+            seen.entry(t).or_default().push(rel);
+        }
+    }
+    let need = min_pages.max(3);
+    if std::env::var_os("GLEAN_DEBUG_CHROME").is_some() {
+        let mut v: Vec<_> = seen.iter().map(|(t, ys)| (ys.len(), t.clone())).collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        eprintln!("[chrome] candidates in margins: {} (need {})", seen.len(), need);
+        for (n, t) in v.iter().take(6) {
+            let ys = &seen[t];
+            let lo = ys.iter().cloned().fold(f64::MAX, f64::min);
+            let hi = ys.iter().cloned().fold(f64::MIN, f64::max);
+            eprintln!("  x{n:<4} band {lo:.3}..{hi:.3} spread {:.3}  {}", hi - lo, &t[..t.len().min(52)]);
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, ys)| {
+            if ys.len() < need {
+                return false;
+            }
+            // same band on every appearance, or it is content that happens to recur
+            let lo = ys.iter().cloned().fold(f64::MAX, f64::min);
+            let hi = ys.iter().cloned().fold(f64::MIN, f64::max);
+            hi - lo < 0.08
+        })
+        .map(|(t, _)| t)
+        .collect()
 }
