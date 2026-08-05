@@ -26,6 +26,10 @@ Options:
       --min-image <px>  smallest image side to keep (default 64)
       --figures         also rasterise vector-drawn charts (needs --images)
       --keep-chrome     keep running heads/footers (dropped by default)
+      --front-matter    prepend a YAML block naming the source and any
+                        pages that could not be read
+      --page-marks      mark page boundaries as <!-- page N --> so a
+                        citation can name the page it came from
       --stats           print page/word/table counts to stderr
   -h, --help            print this help
   -V, --version         print the version
@@ -41,6 +45,8 @@ struct Args {
     jobs: usize,
     stats: bool,
     keep_chrome: bool,
+    front_matter: bool,
+    page_marks: bool,
     json: bool,
     images: Option<String>,
     min_image: u32,
@@ -87,6 +93,8 @@ fn parse_args() -> Result<Args, String> {
         jobs: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
         stats: false,
         keep_chrome: false,
+        front_matter: false,
+        page_marks: false,
         json: false,
         images: None,
         min_image: 64,
@@ -105,6 +113,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--stats" => a.stats = true,
             "--keep-chrome" => a.keep_chrome = true,
+            "--front-matter" => a.front_matter = true,
+            "--page-marks" => a.page_marks = true,
             "--json" => a.json = true,
             "--figures" => a.figures = true,
             "--images" => a.images = Some(it.next().ok_or("--images needs a directory")?),
@@ -257,11 +267,38 @@ fn main() -> ExitCode {
     let joined = if args.json {
         render_json(&args, &wanted, &out, &doc, &images)
     } else {
-        out.iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        let mut doc_md = String::new();
+        if args.front_matter {
+            // An LLM asked to extract fields cannot tell "this lease has no
+            // rent schedule" from "the rent schedule was on a page that could
+            // not be read". Say which it is, up front, in the context window.
+            doc_md.push_str("---\nsource: ");
+            doc_md.push_str(&args.input);
+            doc_md.push_str(&format!("\npages: {}\n", wanted.len()));
+            if empty > 0 {
+                doc_md.push_str(&format!(
+                    "unreadable_pages: {empty}\nwarning: {empty} page(s) have no text layer and are \
+                     absent from this document; they require OCR\n"
+                ));
+            }
+            doc_md.push_str("---\n\n");
+        }
+        let mut first = true;
+        for (slot, text) in out.iter().enumerate() {
+            let t = text.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if !first {
+                doc_md.push_str("\n\n");
+            }
+            first = false;
+            if args.page_marks {
+                doc_md.push_str(&format!("<!-- page {} -->\n\n", wanted[slot] + 1));
+            }
+            doc_md.push_str(t);
+        }
+        doc_md
     };
 
     let res = match &args.output {

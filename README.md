@@ -58,6 +58,7 @@ glean report.pdf --json              # page-addressable JSON
 glean report.pdf --images ./figs     # extract embedded images as PNG
 glean report.pdf --images ./figs --figures   # also rasterise vector charts
 glean report.pdf --keep-chrome       # keep running heads/footers
+glean report.pdf --front-matter --page-marks   # for LLM field extraction
 glean report.pdf --stats             # page/word/table counts to stderr
 ```
 
@@ -177,6 +178,30 @@ actually shipped:
 - a continuation row stays in its table
 - a running footer is chrome, a section heading in the same band is not
 - a degenerate grid is emitted as text, not as `| | |`
+
+### Feeding an LLM
+
+Two flags exist for the field-extraction case:
+
+`--front-matter` prepends the source, the page count, and — the point of it —
+how many pages could not be read:
+
+```yaml
+---
+source: Phase 1 ESA.pdf
+pages: 110
+unreadable_pages: 42
+warning: 42 page(s) have no text layer and are absent from this document; they require OCR
+---
+```
+
+A model asked to pull fields out cannot otherwise distinguish *"this report
+contains no contamination findings"* from *"the findings were on 42 pages that
+are missing from your context"*. It will answer confidently either way. This
+puts the difference in the context window.
+
+`--page-marks` writes `<!-- page N -->` at each boundary so an extracted value
+can cite the page it came from, and so chunking can split on page lines.
 
 ### Rent rolls specifically
 
