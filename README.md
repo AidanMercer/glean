@@ -153,3 +153,7 @@ Ten tests pin the layout heuristics: tracking repair and its two failure
 directions (a two-piece letter split must join; two touching cells and two real
 words must not), justified prose vs. cell rows, two-column statements, spanning
 headers, and empty-cell column stability.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
