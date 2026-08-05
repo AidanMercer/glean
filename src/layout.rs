@@ -204,9 +204,9 @@ pub fn columns(lines: &[Line], page_w: f64) -> Vec<Vec<usize>> {
     // on the first straddler, as this used to, throws away the whole two-column
     // reading order because of one heading.
     let mut groups: Vec<Vec<usize>> = Vec::new();
-    let (mut l, mut r) = (Vec::new(), Vec::new());
+    let (mut l, mut r): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
     let mut paired = 0usize;
-    let mut flush = |l: &mut Vec<usize>, r: &mut Vec<usize>, g: &mut Vec<Vec<usize>>, paired: &mut usize| {
+    let flush = |l: &mut Vec<usize>, r: &mut Vec<usize>, g: &mut Vec<Vec<usize>>, paired: &mut usize| {
         if !l.is_empty() && !r.is_empty() {
             *paired += 1;
         }
@@ -664,7 +664,7 @@ pub fn running_chrome(pages: &[(Vec<Line>, f64)], min_pages: usize) -> std::coll
         }
         for l in lines {
             let rel = l.y / page_h;
-            if !(rel < 0.10 || rel > 0.90) {
+            if (0.10..=0.90).contains(&rel) {
                 continue; // only the margins can hold chrome
             }
             let t = l.text().trim().to_string();
@@ -677,7 +677,7 @@ pub fn running_chrome(pages: &[(Vec<Line>, f64)], min_pages: usize) -> std::coll
     let need = min_pages.max(3);
     if std::env::var_os("GLEAN_DEBUG_CHROME").is_some() {
         let mut v: Vec<_> = seen.iter().map(|(t, ys)| (ys.len(), t.clone())).collect();
-        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
         eprintln!("[chrome] candidates in margins: {} (need {})", seen.len(), need);
         for (n, t) in v.iter().take(6) {
             let ys = &seen[t];
