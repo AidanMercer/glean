@@ -240,6 +240,15 @@ fn render_page(doc: &ffi::Doc, page: usize) -> (String, (usize, usize)) {
     }
     let (pw, ph) = doc.page_size(page);
     let lines = layout::lines(words);
+    if std::env::var_os("GLEAN_DEBUG_LINES").is_some() {
+        for l in &lines {
+            let gaps: Vec<String> = l.words.windows(2)
+                .map(|w| format!("{:.1}", w[1].x0 - w[0].x1)).collect();
+            eprintln!("[line y={:6.1} size={:4.1} n={} gaps=[{}] em3={:.1}] {}",
+                l.y, l.size, l.words.len(), gaps.join(","), l.size * 3.0,
+                l.text().chars().take(70).collect::<String>());
+        }
+    }
     let body = layout::body_size(&lines);
 
     let mut s = String::new();

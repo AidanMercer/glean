@@ -192,12 +192,24 @@ pub fn columns(lines: &[Line], page_w: f64) -> Vec<Vec<usize>> {
 /// reach the right margin, so an absolute em threshold flags ordinary body text
 /// as a table; measuring each gap against the line's median gap does not.
 fn tabular(l: &Line) -> bool {
-    if l.words.len() < 3 {
+    if l.words.len() < 2 {
         return false;
     }
     let em = l.size.max(1.0);
     let gaps: Vec<f64> = l.words.windows(2).map(|p| (p[1].x0 - p[0].x1).max(0.0)).collect();
-    if gaps.len() < 2 {
+
+    // Two-column financial statements — "5100 Revenue      $12,345,678.90" — carry
+    // exactly ONE inter-cell gap, and poppler often returns the label as a single
+    // box, so the row has just two words. Both the ">=3 words" and ">=2 wide gaps"
+    // rules reject it, which is how an entire P&L reads as prose. A lone gap
+    // qualifies only when it is wider than any justified space could stretch, on
+    // a line short enough to be a label/value pair — and the corridor test still
+    // has to agree before this becomes a table.
+    if gaps.iter().any(|g| *g > em * 3.0) && l.words.len() <= 6 {
+        return true;
+    }
+
+    if l.words.len() < 3 || gaps.len() < 2 {
         return false;
     }
     let mut sorted = gaps.clone();
@@ -305,12 +317,15 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
         }
         grid.push(cells);
     }
-    // A table whose rows are nearly all single-cell is really prose.
-    let filled: usize = grid
+    // A table whose rows are nearly all single-cell is really prose. Count rows,
+    // not cells: a statement's section labels ("Income", "Cost of Goods Sold")
+    // each occupy one cell legitimately, and summing cells lets a handful of them
+    // drag a perfectly good P&L below the bar and back into a paragraph.
+    let multi = grid
         .iter()
-        .map(|r| r.iter().filter(|c| !c.is_empty()).count())
-        .sum();
-    if filled < grid.len() * 2 {
+        .filter(|r| r.iter().filter(|c| !c.trim().is_empty()).count() >= 2)
+        .count();
+    if multi * 2 < grid.len() {
         return None;
     }
     let header = rows.first().is_some_and(|l| l.bold()) || grid.len() > 2;
@@ -474,6 +489,18 @@ mod tests {
               (100.0, 112.0, "311"), (150.0, 190.0, "00593101"), (240.0, 290.0, "$1,250,000")],
         );
         assert!(tabular(&l), "a cell-laid-out row must read as tabular");
+    }
+
+    #[test]
+    fn two_column_statement_is_a_table() {
+        // A P&L line: label at the left margin, amount right-aligned far away.
+        // Only one gap exists, so a ">=2 wide gaps" rule reads it as prose.
+        let l = line(8.0, &[(50.0, 78.0, "4200"), (80.0, 110.0, "Sales"),
+                            (480.0, 560.0, "$12,345,678.90")]);
+        assert!(tabular(&l), "a two-column statement row must read as tabular");
+        // poppler often returns the whole label as one box, leaving two words.
+        let two = line(8.0, &[(50.0, 110.0, "5100 Revenue"), (480.0, 560.0, "$12,345,678.90")]);
+        assert!(tabular(&two), "a two-WORD statement row must read as tabular");
     }
 
     #[test]
