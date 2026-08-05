@@ -382,10 +382,15 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
         // measure's name ("Base", "Year"), which would otherwise disqualify it.
         let skip = usize::from(grid.len() > 2);
         let entries: Vec<&String> = grid.iter().skip(skip).filter_map(|r| r.get(c)).collect();
-        let symbolic = entries.iter().any(|v| !v.trim().is_empty())
-            && entries
-                .iter()
-                .all(|v| matches!(v.trim(), "" | "$" | "-" | "—" | "(" | ")"));
+        // Tolerate a minority of stragglers: a wrapped header fragment or a
+        // footnote marker can land in the symbol column without making it a
+        // real column of data.
+        let filled: Vec<&&String> = entries.iter().filter(|v| !v.trim().is_empty()).collect();
+        let syms = filled
+            .iter()
+            .filter(|v| matches!(v.trim(), "$" | "-" | "—" | "(" | ")"))
+            .count();
+        let symbolic = filled.len() >= 2 && syms * 5 >= filled.len() * 4;
         if symbolic {
             for r in grid.iter_mut() {
                 let sym = r[c].trim().to_string();
@@ -432,7 +437,16 @@ pub fn blocks(lines: &[Line], body: f64, page_h: f64) -> Vec<Block> {
                 // of the table, and breaking the run on them splits one table
                 // into fragments that each derive their own, disagreeing,
                 // column boundaries. Only flowed prose ends a table.
-                let prose = !tabular(&lines[j]) && lines[j].words.len() > 4;
+                //
+                // A continuation row is the other trap. Rent rolls merge one set
+                // of figures across two tenant rows, so the second row carries a
+                // unit and a name and nothing else — too few cells to look
+                // tabular, too many words to look like a section label. It is
+                // still part of the table, and it says so by starting in the
+                // table's own first column.
+                let em = lines[j].size.max(1.0);
+                let aligned = (lines[j].x0 - lines[i].x0).abs() < em;
+                let prose = !tabular(&lines[j]) && lines[j].words.len() > 4 && !aligned;
                 if gap > lim || prose {
                     break;
                 }
@@ -613,6 +627,96 @@ mod tests {
         // poppler often returns the whole label as one box, leaving two words.
         let two = line(8.0, &[(50.0, 110.0, "5100 Revenue"), (480.0, 560.0, "$12,345,678.90")]);
         assert!(tabular(&two), "a two-WORD statement row must read as tabular");
+    }
+
+    /// Build a table from rows of (x0, x1, text) and return the emitted grid.
+    fn grid(size: f64, rows: &[Vec<(f64, f64, &str)>]) -> Vec<Vec<String>> {
+        let ls: Vec<Line> = rows.iter().map(|r| line(size, r)).collect();
+        let refs: Vec<&Line> = ls.iter().collect();
+        build_table(&refs).expect("expected a table").rows
+    }
+
+    #[test]
+    fn currency_symbol_column_folds_into_its_figure() {
+        // Accounting layout: "$" left-aligned in its own cell, figure right
+        // aligned in the next. A corridor opens between them.
+        let g = grid(8.0, &[
+            vec![(0.0, 40.0, "Unit"), (120.0, 160.0, "Base")],
+            vec![(0.0, 30.0, "2-280"), (120.0, 128.0, "$"), (170.0, 210.0, "20.08")],
+            vec![(0.0, 30.0, "1-382"), (120.0, 128.0, "$"), (170.0, 210.0, "25.37")],
+            vec![(0.0, 30.0, "1-374"), (120.0, 128.0, "$"), (170.0, 210.0, "40.05")],
+        ]);
+        let body: Vec<&Vec<String>> = g.iter().skip(1).collect();
+        for r in &body {
+            assert!(
+                !r.iter().any(|c| c.trim() == "$"),
+                "a bare $ must not survive as its own cell: {r:?}"
+            );
+        }
+        assert!(
+            body.iter().any(|r| r.iter().any(|c| c.trim() == "$20.08")),
+            "expected $20.08, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn merged_figures_keep_the_continuation_row_in_the_table() {
+        // A rent roll runs one set of figures across two tenant rows; the second
+        // carries a unit and a name only. It belongs to the table.
+        let rows = vec![
+            line(8.0, &[(0.0, 30.0, "4-400"), (40.0, 200.0, "Medispa Westmount 1"),
+                        (300.0, 340.0, "7,889"), (400.0, 460.0, "143,343.13")]),
+            line(8.0, &[(0.0, 30.0, "400"), (40.0, 200.0, "Medispa Westmount 2")]),
+            line(8.0, &[(0.0, 30.0, "4-450"), (40.0, 200.0, "Sotheby's Realty"),
+                        (300.0, 340.0, "585"), (400.0, 460.0, "8,347.95")]),
+        ];
+        let blocks = blocks(&rows, 8.0, 800.0);
+        let tables: Vec<_> = blocks.iter().filter(|b| matches!(b, Block::Table(_))).collect();
+        assert_eq!(tables.len(), 1, "the continuation row must not split the table");
+        if let Some(Block::Table(t)) = tables.first().copied() {
+            assert_eq!(t.rows.len(), 3, "all three rows belong to one table");
+        }
+    }
+
+    #[test]
+    fn chrome_is_found_but_headings_are_spared() {
+        let page_h = 800.0;
+        let mut pages = Vec::new();
+        for _ in 0..8 {
+            pages.push((
+                vec![
+                    // running footer: body size, deep in the margin
+                    line(8.0, &[(0.0, 200.0, "Docusign Envelope ID: 4808F9DA")]),
+                    // section heading: same band, but LARGER than body
+                    line(16.0, &[(0.0, 120.0, "Appendix A")]),
+                ],
+                page_h,
+            ));
+        }
+        // put them in the top margin
+        for (ls, _) in pages.iter_mut() {
+            for l in ls.iter_mut() {
+                l.y = 20.0;
+            }
+        }
+        let set = running_chrome(&pages, 2, 8.0);
+        assert!(set.contains("Docusign Envelope ID: 4808F9DA"), "footer must be chrome");
+        assert!(!set.contains("Appendix A"), "a heading must never be chrome: {set:?}");
+    }
+
+    #[test]
+    fn degenerate_grid_is_not_emitted_as_a_table() {
+        // Two aligned words and nothing else is a layout accident.
+        let ls = vec![
+            line(8.0, &[(0.0, 20.0, "a"), (200.0, 220.0, "b")]),
+            line(8.0, &[(0.0, 20.0, "c")]),
+        ];
+        let refs: Vec<&Line> = ls.iter().collect();
+        if let Some(t) = build_table(&refs) {
+            let mut out = String::new();
+            crate::md::emit(&mut out, &Block::Table(t));
+            assert!(!out.contains("---"), "degenerate grid must not emit a table: {out:?}");
+        }
     }
 
     #[test]

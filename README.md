@@ -155,9 +155,7 @@ document: process the text pages, silently drop 42 scanned ones, and exit 0. For
 the ESA in the test corpus those 42 pages held the historical contamination
 evidence. Route them to an OCR engine; glean will not pretend they were not there.
 
-Vertically merged cells still split a table: where a rent roll runs one set of
-figures across two tenant rows, the second row lands outside the table. No
-formulas, no reading of embedded attachments. `--images` extracts embedded
+No formulas, no reading of embedded attachments. `--images` extracts embedded
 rasters, but a vector chart drawn with path operators is not an image and will
 not be captured.
 
@@ -167,10 +165,28 @@ not be captured.
 cargo test
 ```
 
-Ten tests pin the layout heuristics: tracking repair and its two failure
-directions (a two-piece letter split must join; two touching cells and two real
-words must not), justified prose vs. cell rows, two-column statements, spanning
-headers, and empty-cell column stability.
+Fourteen tests pin the layout heuristics, each one standing on a bug that
+actually shipped:
+
+- tracking repair and both failure directions — a two-piece letter split must
+  join, two touching cells and two real words must not
+- justified prose vs. cell rows; two-column statements
+- spanning headers must not erase the columns beneath them
+- empty cells hold their column instead of shifting later ones left
+- a currency symbol never survives as its own cell
+- a continuation row stays in its table
+- a running footer is chrome, a section heading in the same band is not
+- a degenerate grid is emitted as text, not as `| | |`
+
+### Rent rolls specifically
+
+Rent rolls are the document this was hardened against, because they are the ones
+whose errors reach a valuation. Three of them have been checked cell-by-cell
+against **rendered page images** rather than against the text layer — the only
+check that does not run through the same engine glean extracts with. All values
+matched, including the cells that are legitimately empty: a tenant with no
+step-up, another with no renewal option, a pair of tenants whose figures are
+merged across two rows.
 
 ## License
 
