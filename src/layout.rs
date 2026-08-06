@@ -502,8 +502,65 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
     if multi * 2 < grid.len() {
         return None;
     }
+    // Two-tier headers. A wide table bands its columns under a spanning banner —
+    // `Property Description` across three columns, `Unit Details` across six —
+    // and the banner takes the header row, leaving the real column labels in the
+    // first BODY row. Nothing is lost and every value is present, so a recall
+    // metric scores it perfectly; what breaks is the binding a model actually
+    // extracts by. It reads the banner as the column's meaning, and reads the
+    // labels as a tenant whose Unit Type is "Unit Type".
+    //
+    // The tell is a header that is mostly empty sitting above a row that is
+    // fully populated and carries no figures, over rows that do. Fold the banner
+    // INTO the labels rather than dropping either: `Tenant Profile / Tenant`
+    // keeps the grouping without costing the field its name.
+    if grid.len() > 3 {
+        let ncol = grid[0].len();
+        let blank_head = grid[0].iter().filter(|c| c.trim().is_empty()).count();
+        let filled = grid[1].iter().filter(|c| !c.trim().is_empty()).count();
+        let numeric_row = |r: &Vec<String>| r.iter().any(|c| numeric_cell(c));
+        // A column label is a name. `Total per Unit`, `Unit Area (SF)`, `% of
+        // NRA` all qualify; `1 2 of 14` does not, and neither does a DocuSign
+        // stamp — a 4-row block of envelope junk on an ESA appendix page passes
+        // every other test here, and folding its rows together welded a page
+        // number onto an envelope id. Requiring the labels to carry no figures
+        // at all costs a genuine `2025 Actuals` sub-label and buys back every
+        // false positive in the corpus, which is the right side to err on: the
+        // penalty is leaving a table exactly as it was.
+        let wordy = |r: &Vec<String>| !r.iter().any(|c| c.chars().any(|ch| ch.is_ascii_digit()));
+        let banded = blank_head * 5 >= ncol * 2      // banner leaves most cells empty
+            && filled * 10 >= ncol * 7               // labels fill their row
+            && wordy(&grid[1])                       // …and are labels, not data
+            && grid.iter().skip(2).any(numeric_row); // …over something measured
+        if banded {
+            for (i, top) in grid.remove(0).into_iter().enumerate() {
+                let top = top.trim();
+                if top.is_empty() {
+                    continue;
+                }
+                match grid[0].get_mut(i) {
+                    Some(cell) if !cell.trim().is_empty() => {
+                        *cell = format!("{top} / {}", cell.trim());
+                    }
+                    Some(cell) => *cell = top.to_string(),
+                    None => {}
+                }
+            }
+        }
+    }
+
     let header = rows.first().is_some_and(|l| l.bold()) || grid.len() > 2;
     Some(Table { rows: grid, header })
+}
+
+/// A cell that reads as a figure rather than a label. Deliberately loose:
+/// `$1,200`, `(4.5%)` and `12` all count, `Suite 400` does not — a label with a
+/// number in it is still a label.
+fn numeric_cell(s: &str) -> bool {
+    let t = s.trim().trim_matches(|c| matches!(c, '$' | '(' | ')' | '%' | '*' | '-'));
+    !t.is_empty()
+        && t.chars().any(|c| c.is_ascii_digit())
+        && t.chars().all(|c| c.is_ascii_digit() || matches!(c, ',' | '.' | ' '))
 }
 
 pub fn blocks(lines: &[Line], body: f64, page_h: f64) -> Vec<Block> {
@@ -610,6 +667,71 @@ pub fn body_size(lines: &[Line]) -> f64 {
         .max_by_key(|(_, c)| *c)
         .map(|(s, _)| s)
         .unwrap_or(10.0)
+}
+
+/// Text that repeats in the same margin position across most pages: a running
+/// head, a footer, a template stamp, a DocuSign envelope id.
+///
+/// This has to be a document-level decision. Nothing about the line in
+/// isolation says "boilerplate" — `Docusign Envelope ID: 4808F9DA…` looks like
+/// ordinary content on page 1 and is only revealed as chrome by appearing on
+/// all 59. Requiring a consistent margin position keeps a genuinely repeated
+/// body sentence (a defined term, a recurring clause) out of the set.
+pub fn running_chrome(
+    pages: &[(Vec<Line>, f64)],
+    min_pages: usize,
+    body: f64,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, Vec<f64>> = HashMap::new();
+    for (lines, page_h) in pages {
+        if *page_h <= 0.0 {
+            continue;
+        }
+        for l in lines {
+            let rel = l.y / page_h;
+            if (0.08..=0.92).contains(&rel) {
+                continue; // only the margins can hold chrome
+            }
+            // Chrome is never set larger than body text; a section heading at the
+            // top of a page sits in the same band and is NOT chrome. Without this
+            // guard "## Appendix A", a photo caption, and the title of a short
+            // agreement all get deleted — silent data loss, which is far worse
+            // than the boilerplate it was trying to remove.
+            if body > 0.0 && l.size > body * 1.02 {
+                continue;
+            }
+            let t = l.text().trim().to_string();
+            if t.chars().count() < 8 {
+                continue;
+            }
+            seen.entry(t).or_default().push(rel);
+        }
+    }
+    let need = min_pages.max(3);
+    if std::env::var_os("GLEAN_DEBUG_CHROME").is_some() {
+        let mut v: Vec<_> = seen.iter().map(|(t, ys)| (ys.len(), t.clone())).collect();
+        v.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+        eprintln!("[chrome] candidates in margins: {} (need {})", seen.len(), need);
+        for (n, t) in v.iter().take(6) {
+            let ys = &seen[t];
+            let lo = ys.iter().cloned().fold(f64::MAX, f64::min);
+            let hi = ys.iter().cloned().fold(f64::MIN, f64::max);
+            eprintln!("  x{n:<4} band {lo:.3}..{hi:.3} spread {:.3}  {}", hi - lo, &t[..t.len().min(52)]);
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, ys)| {
+            if ys.len() < need {
+                return false;
+            }
+            // same band on every appearance, or it is content that happens to recur
+            let lo = ys.iter().cloned().fold(f64::MAX, f64::min);
+            let hi = ys.iter().cloned().fold(f64::MIN, f64::max);
+            hi - lo < 0.08
+        })
+        .map(|(t, _)| t)
+        .collect()
 }
 
 #[cfg(test)]
@@ -819,7 +941,7 @@ mod tests {
     #[test]
     fn degenerate_grid_is_not_emitted_as_a_table() {
         // Two aligned words and nothing else is a layout accident.
-        let ls = vec![
+        let ls = [
             line(8.0, &[(0.0, 20.0, "a"), (200.0, 220.0, "b")]),
             line(8.0, &[(0.0, 20.0, "c")]),
         ];
@@ -861,69 +983,39 @@ mod tests {
         assert_eq!(t.rows[2].last().map(|s| s.as_str()), Some(""));
         assert_eq!(t.rows[0].last().map(|s| s.as_str()), Some("Dec"));
     }
-}
 
-/// Text that repeats in the same margin position across most pages: a running
-/// head, a footer, a template stamp, a DocuSign envelope id.
-///
-/// This has to be a document-level decision. Nothing about the line in
-/// isolation says "boilerplate" — `Docusign Envelope ID: 4808F9DA…` looks like
-/// ordinary content on page 1 and is only revealed as chrome by appearing on
-/// all 59. Requiring a consistent margin position keeps a genuinely repeated
-/// body sentence (a defined term, a recurring clause) out of the set.
-pub fn running_chrome(
-    pages: &[(Vec<Line>, f64)],
-    min_pages: usize,
-    body: f64,
-) -> std::collections::HashSet<String> {
-    use std::collections::HashMap;
-    let mut seen: HashMap<String, Vec<f64>> = HashMap::new();
-    for (lines, page_h) in pages {
-        if *page_h <= 0.0 {
-            continue;
-        }
-        for l in lines {
-            let rel = l.y / page_h;
-            if (0.08..=0.92).contains(&rel) {
-                continue; // only the margins can hold chrome
-            }
-            // Chrome is never set larger than body text; a section heading at the
-            // top of a page sits in the same band and is NOT chrome. Without this
-            // guard "## Appendix A", a photo caption, and the title of a short
-            // agreement all get deleted — silent data loss, which is far worse
-            // than the boilerplate it was trying to remove.
-            if body > 0.0 && l.size > body * 1.02 {
-                continue;
-            }
-            let t = l.text().trim().to_string();
-            if t.chars().count() < 8 {
-                continue;
-            }
-            seen.entry(t).or_default().push(rel);
-        }
+    #[test]
+    fn a_banner_row_does_not_take_the_labels_place() {
+        // `Property Description` and `Tenant Profile` band the columns; the real
+        // labels are the row beneath. Left alone, the header carries the banner
+        // and the labels are emitted as a tenant whose Class is "Class".
+        let banner = line(7.0, &[(0.0, 20.0, "Description"), (120.0, 150.0, "Profile")]);
+        let labels = line(7.0, &[(0.0, 20.0, "Class"), (40.0, 90.0, "Grade"),
+                                 (120.0, 150.0, "Tenant"), (200.0, 240.0, "Area")]);
+        let r1 = line(7.0, &[(0.0, 20.0, "B"), (40.0, 90.0, "A"),
+                             (120.0, 150.0, "Rogers"), (200.0, 240.0, "5,200")]);
+        let r2 = line(7.0, &[(0.0, 20.0, "C"), (40.0, 90.0, "B"),
+                             (120.0, 150.0, "Thuet"), (200.0, 240.0, "1,100")]);
+        let t = build_table(&[&banner, &labels, &r1, &r2]).expect("should build a table");
+        assert_eq!(t.rows[0][0], "Description / Class");
+        assert_eq!(t.rows[0][2], "Profile / Tenant");
+        assert_eq!(t.rows[0][3], "Area");
+        assert_eq!(t.rows[1][0], "B", "the data must still start at row 1");
     }
-    let need = min_pages.max(3);
-    if std::env::var_os("GLEAN_DEBUG_CHROME").is_some() {
-        let mut v: Vec<_> = seen.iter().map(|(t, ys)| (ys.len(), t.clone())).collect();
-        v.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-        eprintln!("[chrome] candidates in margins: {} (need {})", seen.len(), need);
-        for (n, t) in v.iter().take(6) {
-            let ys = &seen[t];
-            let lo = ys.iter().cloned().fold(f64::MAX, f64::min);
-            let hi = ys.iter().cloned().fold(f64::MIN, f64::max);
-            eprintln!("  x{n:<4} band {lo:.3}..{hi:.3} spread {:.3}  {}", hi - lo, &t[..t.len().min(52)]);
-        }
+
+    #[test]
+    fn a_banner_over_real_data_is_left_alone() {
+        // The other appraisal table: the same banner shape, but the row beneath
+        // it is DATA, not labels. Folding it would weld a value onto a heading.
+        let banner = line(7.0, &[(0.0, 20.0, "Description"), (120.0, 150.0, "Summary")]);
+        let r1 = line(7.0, &[(0.0, 20.0, "Site"), (40.0, 90.0, "1.2"),
+                             (120.0, 150.0, "Value"), (200.0, 240.0, "67,100")]);
+        let r2 = line(7.0, &[(0.0, 20.0, "Floors"), (40.0, 90.0, "6"),
+                             (120.0, 150.0, "Rate"), (200.0, 240.0, "5,200")]);
+        let r3 = line(7.0, &[(0.0, 20.0, "Units"), (40.0, 90.0, "34"),
+                             (120.0, 150.0, "Term"), (200.0, 240.0, "1,100")]);
+        let t = build_table(&[&banner, &r1, &r2, &r3]).expect("should build a table");
+        assert_eq!(t.rows[0][0], "Description");
+        assert_eq!(t.rows[1][0], "Site");
     }
-    seen.into_iter()
-        .filter(|(_, ys)| {
-            if ys.len() < need {
-                return false;
-            }
-            // same band on every appearance, or it is content that happens to recur
-            let lo = ys.iter().cloned().fold(f64::MAX, f64::min);
-            let hi = ys.iter().cloned().fold(f64::MIN, f64::max);
-            hi - lo < 0.08
-        })
-        .map(|(t, _)| t)
-        .collect()
 }

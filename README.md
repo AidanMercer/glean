@@ -160,6 +160,24 @@ strictly-zero occupancy lets that one row destroy the whole grid, so a few
 crossings are tolerated — with a floor of one, or short tables lose the
 allowance to rounding and fail where long ones survive by luck.
 
+**A banner is not a column label.** A wide table bands its columns under a
+spanning title — `Tenant Profile` over three, `Unit Details` over six — and that
+banner takes the Markdown header row, leaving the real labels in the first
+*body* row. Nothing is lost and every value is present, so recall scores it
+perfectly; what breaks is the binding a model extracts by. It reads the banner
+as the column's meaning and reads the labels as a tenant whose Unit Type is
+"Unit Type". The two rows are folded together instead — `Tenant Profile /
+Tenant` — which keeps the grouping without costing the field its name. On a
+credit summary with a stacked header this is the difference between `Gross
+Commitment` and `Net Commitment` and two columns both labelled `Commitment`.
+
+The tell is a mostly-empty header over a fully-populated row of labels, over
+rows that carry figures — and the labels must carry no figures themselves. That
+last condition is doing real work: without it a four-row block of DocuSign
+envelope junk on an ESA appendix page passes every other test, and folding its
+rows welds a page number onto an envelope id. Across 3,068 tables from 61 real
+deal documents this fires on 19 and costs 0 recall.
+
 ## What it does not do
 
 **No OCR.** glean reads the text layer. Scanned pages have none, and it says so
@@ -200,7 +218,7 @@ not be captured.
 cargo test
 ```
 
-Twenty-four tests pin the layout heuristics and the front matter, each one
+Twenty-six tests pin the layout heuristics and the front matter, each one
 standing on a bug that actually shipped:
 
 - tracking repair and both failure directions — a two-piece letter split must
@@ -216,6 +234,8 @@ standing on a bug that actually shipped:
 - only scans are reported as needing OCR — not figures, not blank pages
 - a page-sized raster is a scan and a small one is not; vector ink is neither
 - a source path containing a colon stays one YAML field
+- a banner row does not take the column labels' place — and a banner over real
+  data is left alone
 - a scan renders at its own resolution; a thumbnail does not drag it up
 
 ### Feeding an LLM
