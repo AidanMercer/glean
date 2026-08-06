@@ -57,6 +57,7 @@ glean report.pdf -p 32,74 -j 8       # only these pages, 8 threads
 glean report.pdf --json              # page-addressable JSON
 glean report.pdf --images ./figs     # extract embedded images as PNG
 glean report.pdf --images ./figs --figures   # also rasterise vector charts
+glean report.pdf --ocr-pages ./scans # write the scanned pages out for OCR
 glean report.pdf --keep-chrome       # keep running heads/footers
 glean report.pdf --front-matter --page-marks   # for LLM field extraction
 glean report.pdf --stats             # page/word/table counts to stderr
@@ -71,18 +72,35 @@ response so a pipeline written against one can consume the other unchanged:
 {
   "pages": [
     {"page": 1, "anchor": "page-1", "width": 720.0, "height": 540.0,
-     "has_text": true, "markdown": "# ...",
+     "has_text": true, "kind": "text", "markdown": "# ...",
      "images": [{"path": "figs/p001-03.png", "width": 1033, "height": 738,
                  "bbox": [284.4, 209.6, 679.4, 491.7], "page_fraction": 0.287}]}
   ],
   "full_markdown": "...",
-  "meta": {"source": "report.pdf", "pages": 10, "images": 29}
+  "meta": {"source": "report.pdf", "pages": 10, "pages_included": 10,
+           "unreadable_pages": 0, "scanned_pages": [], "blank_pages": 0,
+           "images": 29}
 }
 ```
 
-`has_text` is the field to route on. A page with `has_text: false` carrying one
-image at `page_fraction: 1.0` is a scan — send that page to OCR. Nothing else in
-the output distinguishes it, which is exactly the silent-truncation trap.
+`kind` is the field to route on:
+
+| kind | what it is | what to do |
+|---|---|---|
+| `text` | read from the text layer | nothing |
+| `scan` | a page-sized raster, no text | send this page to OCR |
+| `image` | a figure or chart, no text | `--images` if you want the picture |
+| `blank` | no text, no ink, no raster | nothing — nothing is missing |
+
+Only `scan` costs money downstream, and on a mixed document it is usually a
+small minority: a 19-page credit agreement in the test set is one text page and
+18 scans, and a 4-page site-visit report is one text page and three
+photographs — which need no OCR at all, and were reported as needing it until
+the classifier could tell them apart.
+
+`full_markdown` is the same string the Markdown mode writes, front matter and
+page marks included when those flags are set. `pages` is the length of the
+**document**; `pages_included` is how much of it is in this output.
 
 ### Images
 
@@ -145,16 +163,32 @@ allowance to rounding and fail where long ones survive by luck.
 ## What it does not do
 
 **No OCR.** glean reads the text layer. Scanned pages have none, and it says so
-on stderr with a count, then exits non-zero if *every* page was scanned:
+on stderr — naming them, so the reply is one command and not a hunt:
 
 ```
-glean: warning: 42 of 110 page(s) have no text layer and were skipped; they need OCR
+glean: warning: 18 of 19 page(s) are scans with no text layer and were skipped;
+they need OCR: 1-13, 15-19
 ```
 
 That warning exists because the alternative is what anydoc does on a mixed
-document: process the text pages, silently drop 42 scanned ones, and exit 0. For
-the ESA in the test corpus those 42 pages held the historical contamination
-evidence. Route them to an OCR engine; glean will not pretend they were not there.
+document: process the text pages, silently drop the scanned ones, and exit 0.
+Route them to an OCR engine; glean will not pretend they were not there.
+
+`--ocr-pages DIR` is the reply, in the same run that raises the warning: one
+`page-NNNN.png` per scanned page, ready to post. Each is rendered at the
+resolution its own scan was captured at — a 300 dpi fax re-rendered at 150 loses
+half the ink OCR has to read, and at 600 it invents nothing and quadruples the
+bytes — bounded to 150–400 dpi, `--ocr-dpi` to override. Whole pages are
+rendered rather than the embedded raster lifted, because a scanned page is
+sometimes several tiles and often carries a stamp or a signature drawn over the
+scan.
+
+It names only the scans. A page with no text is not necessarily a page with
+something missing — it can be a photograph, a chart drawn in vector, or a blank
+separator sheet, and telling a model that a blank page "requires OCR" is its own
+small lie. Classifying costs one content-stream walk over the wordless pages
+with no pixel decoding, and only when there are any: 11 ms on a 54-page scanned
+lease, nothing at all on a document with a text layer throughout.
 
 No formulas, no reading of embedded attachments. `--images` extracts embedded
 rasters, but a vector chart drawn with path operators is not an image and will
@@ -166,8 +200,8 @@ not be captured.
 cargo test
 ```
 
-Fourteen tests pin the layout heuristics, each one standing on a bug that
-actually shipped:
+Twenty-four tests pin the layout heuristics and the front matter, each one
+standing on a bug that actually shipped:
 
 - tracking repair and both failure directions — a two-piece letter split must
   join, two touching cells and two real words must not
@@ -178,20 +212,27 @@ actually shipped:
 - a continuation row stays in its table
 - a running footer is chrome, a section heading in the same band is not
 - a degenerate grid is emitted as text, not as `| | |`
+- a page subset states the document's length, not the subset's
+- only scans are reported as needing OCR — not figures, not blank pages
+- a page-sized raster is a scan and a small one is not; vector ink is neither
+- a source path containing a colon stays one YAML field
+- a scan renders at its own resolution; a thumbnail does not drag it up
 
 ### Feeding an LLM
 
 Two flags exist for the field-extraction case:
 
-`--front-matter` prepends the source, the page count, and — the point of it —
-how many pages could not be read:
+`--front-matter` prepends the source, the length of the document, and — the point
+of it — every way this copy of it is incomplete:
 
 ```yaml
 ---
-source: Phase 1 ESA.pdf
-pages: 110
-unreadable_pages: 42
-warning: 42 page(s) have no text layer and are absent from this document; they require OCR
+source: "2026.05.22 SIGNED CSMC CCL.pdf"
+pages: 19
+unreadable_pages: 18
+scanned_pages: "1-13, 15-19"
+warnings:
+  - "18 page(s) are scans with no text layer and are absent from this document; they require OCR: 1-13, 15-19"
 ---
 ```
 
@@ -200,8 +241,27 @@ contains no contamination findings"* from *"the findings were on 42 pages that
 are missing from your context"*. It will answer confidently either way. This
 puts the difference in the context window.
 
+There are two ways to hand a model a hole, and the second one is quieter. `-p`
+gives it part of a document; if the front matter then reports the size of the
+*slice*, a two-page extract of a 33-page deal reads as a two-page deal. So the
+document's real length is always stated, and a subset says so:
+
+```yaml
+---
+source: "deal.pdf"
+pages: 33
+pages_included: 2
+included: "2, 4"
+warnings:
+  - "31 of 33 pages are not in this document; only page(s) 2, 4 were converted"
+---
+```
+
 `--page-marks` writes `<!-- page N -->` at each boundary so an extracted value
 can cite the page it came from, and so chunking can split on page lines.
+
+Both flags apply to `--json` as well, where they shape `full_markdown` — the
+field a pipeline actually hands to a model.
 
 ### Rent rolls specifically
 
