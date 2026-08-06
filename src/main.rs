@@ -25,6 +25,8 @@ Options:
       --images <dir>    extract embedded images to <dir> as PNG
       --min-image <px>  smallest image side to keep (default 64)
       --figures         also rasterise vector-drawn charts (needs --images)
+      --cells           with --json, give every table cell a page-anchored
+                        ref and its box, so a value can cite the cell
       --ocr-pages <dir> write one PNG per scanned page, ready to send to an
                         OCR engine; rendered at each scan's own resolution
       --ocr-dpi <n>     render at this resolution instead (150-400)
@@ -60,6 +62,7 @@ struct Args {
     figures: bool,
     ocr_pages: Option<String>,
     ocr_dpi: Option<f64>,
+    cells: bool,
 }
 
 /// What the page survey concluded. Carried as one value because every consumer
@@ -67,12 +70,30 @@ struct Args {
 /// whole picture, and splitting it up is how the front matter and the JSON came
 /// to disagree about what a page was in the first place.
 struct Survey {
-    /// Per page of the output, in `wanted` order.
-    kinds: Vec<imgffi::PageKind>,
     /// 1-based page numbers, in document order.
     scanned: Vec<usize>,
     image_only: Vec<usize>,
     blank: usize,
+}
+
+/// One emitted table's cells, addressed the way the reader sees them — after
+/// padding, blank rows and blank edge columns are gone.
+struct TableCells {
+    /// This table's order on its page, 1-based.
+    index: usize,
+    nrow: usize,
+    ncol: usize,
+    /// row, column (both 1-based, row 1 is the header), text, box on the page.
+    cells: Vec<(usize, usize, String, layout::Rect)>,
+}
+
+/// Everything held per page of the output, in `wanted` order, plus what the
+/// survey concluded about the document as a whole.
+struct Pages {
+    markdown: Vec<String>,
+    kinds: Vec<imgffi::PageKind>,
+    cells: Vec<Vec<TableCells>>,
+    survey: Survey,
 }
 
 fn parse_pages(spec: &str) -> Option<Vec<usize>> {
@@ -123,6 +144,7 @@ fn parse_args() -> Result<Args, String> {
         figures: false,
         ocr_pages: None,
         ocr_dpi: None,
+        cells: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -141,6 +163,7 @@ fn parse_args() -> Result<Args, String> {
             "--page-marks" => a.page_marks = true,
             "--json" => a.json = true,
             "--figures" => a.figures = true,
+            "--cells" => a.cells = true,
             "--images" => a.images = Some(it.next().ok_or("--images needs a directory")?),
             "--ocr-pages" => a.ocr_pages = Some(it.next().ok_or("--ocr-pages needs a directory")?),
             "--ocr-dpi" => {
@@ -293,12 +316,14 @@ fn main() -> ExitCode {
     // Phase 2: serialise, dropping the chrome.
     let mut out: Vec<String> = vec![String::new(); wanted.len()];
     let mut kinds: Vec<imgffi::PageKind> = vec![imgffi::PageKind::Text; wanted.len()];
+    let mut cells: Vec<Vec<TableCells>> = Vec::with_capacity(wanted.len());
     let (mut tables, mut words) = (0usize, 0usize);
     for (slot, (lines, ph)) in pages.iter().enumerate() {
-        let (t, s) = render_lines(lines, widths[slot], *ph, &chrome);
+        let (t, s, tc) = render_lines(lines, widths[slot], *ph, &chrome, args.cells);
         words += s.0;
         tables += s.1;
         out[slot] = t;
+        cells.push(tc);
         // Judged BEFORE the chrome filter, deliberately. A page carrying nothing
         // but a running header HAS a text layer; we dropped it on purpose, and
         // billing the caller for OCR on our own suppression would be absurd.
@@ -340,8 +365,10 @@ fn main() -> ExitCode {
         scanned: pages_of(imgffi::PageKind::Scan),
         image_only: pages_of(imgffi::PageKind::Image),
         blank: pages_of(imgffi::PageKind::Blank).len(),
-        kinds,
     };
+    let page_data = Pages { markdown: out, kinds, cells, survey };
+    let out = &page_data.markdown;
+    let survey = &page_data.survey;
 
     // The reply to the warning, in the same run that raises it. Without this the
     // caller is told "pages 1-13, 15-19 need OCR" and then has to re-render
@@ -399,7 +426,7 @@ fn main() -> ExitCode {
     // actually reads. One string, no second implementation to drift.
     let mut document = String::new();
     if args.front_matter {
-        document.push_str(&front_matter(&args, doc.pages, &wanted, &survey));
+        document.push_str(&front_matter(&args, doc.pages, &wanted, survey));
     }
     let mut first = true;
     for (slot, text) in out.iter().enumerate() {
@@ -418,7 +445,7 @@ fn main() -> ExitCode {
     }
 
     let joined = if args.json {
-        render_json(&args, &wanted, &out, &survey, &document, &doc, &images)
+        render_json(&args, &wanted, &page_data, &document, &doc, &images)
     } else {
         document.clone()
     };
@@ -547,7 +574,8 @@ fn render_lines(
     page_w: f64,
     page_h: f64,
     chrome: &std::collections::HashSet<String>,
-) -> (String, (usize, usize)) {
+    cells: bool,
+) -> (String, (usize, usize), Vec<TableCells>) {
     let kept: Vec<layout::Line> = if chrome.is_empty() {
         lines.to_vec()
     } else {
@@ -559,22 +587,52 @@ fn render_lines(
     };
     let n: usize = kept.iter().map(|l| l.words.len()).sum();
     if n == 0 {
-        return (String::new(), (0, 0));
+        return (String::new(), (0, 0), Vec::new());
     }
     let body = layout::body_size(&kept);
 
     let mut s = String::new();
     let mut ntab = 0;
+    let mut tables = Vec::new();
     for col in layout::columns(&kept, page_w.max(1.0)) {
         let sub: Vec<layout::Line> = col.into_iter().map(|i| kept[i].clone()).collect();
         for b in layout::blocks(&sub, body, page_h.max(1.0)) {
-            if matches!(b, layout::Block::Table(_)) {
+            if let layout::Block::Table(t) = &b {
                 ntab += 1;
+                // Provenance comes off the SAME normalisation the Markdown is
+                // written from, so a cited row and column address the table the
+                // reader is looking at. A degenerate block is emitted as prose
+                // and has no cells to cite.
+                if cells {
+                    if let Some(norm) = md::normalise(t) {
+                        if !norm.degenerate {
+                            tables.push(collect_cells(tables.len() + 1, &norm));
+                        }
+                    }
+                }
             }
             md::emit(&mut s, &b);
         }
     }
-    (s, (n, ntab))
+    (s, (n, ntab), tables)
+}
+
+/// Every cell that says something and knows where it said it. A blank cell has
+/// no box and nothing to cite, so it is left out rather than emitted empty.
+fn collect_cells(index: usize, n: &md::Norm) -> TableCells {
+    let mut cells = Vec::new();
+    for (ri, row) in n.rows.iter().enumerate() {
+        for (ci, text) in row.iter().enumerate() {
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if let Some(Some(b)) = n.boxes.get(ri).map(|r| r.get(ci).copied().flatten()) {
+                cells.push((ri + 1, ci + 1, text.to_string(), b));
+            }
+        }
+    }
+    TableCells { index, nrow: n.rows.len(), ncol: n.rows[0].len(), cells }
 }
 
 /// JSON escape, sufficient for the subset we emit.
@@ -600,12 +658,13 @@ fn jesc(s: &str) -> String {
 fn render_json(
     args: &Args,
     wanted: &[usize],
-    out: &[String],
-    sv: &Survey,
+    pg: &Pages,
     document: &str,
     doc: &ffi::Doc,
     images: &[imgffi::Image],
 ) -> String {
+    let sv = &pg.survey;
+    let out = &pg.markdown;
     let mut s = String::from("{\n  \"pages\": [\n");
     for (slot, &p) in wanted.iter().enumerate() {
         let md = out[slot].trim();
@@ -617,8 +676,8 @@ fn render_json(
         s.push_str(&format!(
             "    {{\"page\": {}, \"anchor\": \"page-{}\", \"width\": {:.1}, \"height\": {:.1}, \"has_text\": {}, \"kind\": \"{}\", \"markdown\": \"{}\"",
             p + 1, p + 1, w, h,
-            sv.kinds[slot] == imgffi::PageKind::Text,
-            sv.kinds[slot].as_str(),
+            pg.kinds[slot] == imgffi::PageKind::Text,
+            pg.kinds[slot].as_str(),
             jesc(md)
         ));
         if !imgs.is_empty() {
@@ -631,6 +690,34 @@ fn render_json(
                     "{{\"path\": \"{}\", \"width\": {}, \"height\": {}, \"bbox\": [{:.1}, {:.1}, {:.1}, {:.1}], \"page_fraction\": {:.3}}}",
                     jesc(&i.path), i.w, i.h, i.x0, i.y0, i.x1, i.y1, i.page_fraction(w, h)
                 ));
+            }
+            s.push(']');
+        }
+        // Cell provenance. A PDF-sourced value can now cite where it was read
+        // the way a spreadsheet-sourced one does, instead of citing a whole
+        // page and leaving the reader to search it. Opt-in, because it is
+        // several cells of JSON per value and no use to a consumer that only
+        // wants the prose.
+        if let Some(ts) = pg.cells.get(slot).filter(|t| !t.is_empty()) {
+            s.push_str(", \"tables\": [");
+            for (k, t) in ts.iter().enumerate() {
+                if k > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&format!(
+                    "{{\"table\": {}, \"rows\": {}, \"cols\": {}, \"cells\": [",
+                    t.index, t.nrow, t.ncol
+                ));
+                for (m, (r, c, text, b)) in t.cells.iter().enumerate() {
+                    if m > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&format!(
+                        "{{\"ref\": \"p{}!t{}!r{r}c{c}\", \"row\": {r}, \"col\": {c}, \"text\": \"{}\", \"bbox\": [{:.1}, {:.1}, {:.1}, {:.1}]}}",
+                        p + 1, t.index, jesc(text), b[0], b[1], b[2], b[3]
+                    ));
+                }
+                s.push_str("]}");
             }
             s.push(']');
         }
@@ -679,11 +766,12 @@ mod tests {
             figures: false,
             ocr_pages: None,
             ocr_dpi: None,
+            cells: false,
         }
     }
 
     fn survey(scanned: Vec<usize>, image_only: Vec<usize>, blank: usize) -> Survey {
-        Survey { kinds: Vec::new(), scanned, image_only, blank }
+        Survey { scanned, image_only, blank }
     }
 
     fn img(page: usize, x0: f64, y0: f64, x1: f64, y1: f64) -> Image {

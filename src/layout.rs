@@ -44,7 +44,99 @@ pub enum Block {
 #[derive(Debug)]
 pub struct Table {
     pub rows: Vec<Vec<String>>,
+    /// Where each cell sits on the page, in PDF points. `None` for a cell that
+    /// holds no words — an empty cell has no box, and inventing one would be
+    /// inventing evidence. Same shape as `rows`, always.
+    pub boxes: Vec<Vec<Option<Rect>>>,
     pub header: bool,
+}
+
+/// A box on the page, in PDF points: x0, y0, x1, y1.
+pub type Rect = [f64; 4];
+
+pub fn union(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            Some([a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
+        }
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// A grid under construction: what every cell says, and where it says it.
+///
+/// Column surgery is the only thing that happens to a grid after it is built —
+/// four separate repairs below fold one column into its neighbour and drop it —
+/// and the text and the geometry have to undergo it together. A cell citing a
+/// box it no longer occupies is worse than a cell citing nothing, because it
+/// reads as evidence. So there is exactly one operation here that removes a
+/// column, and it moves both; a fifth repair cannot move one without the other
+/// without going out of its way.
+///
+/// Where a merge discards one side's text, the surviving box is still the union
+/// of both. That errs wide: the box contains the value either way, and a box
+/// that is too big only costs the reader precision, where a box in the wrong
+/// place costs them the answer.
+struct Grid {
+    text: Vec<Vec<String>>,
+    boxes: Vec<Vec<Option<Rect>>>,
+}
+
+impl Grid {
+    fn ncol(&self) -> usize {
+        self.text.first().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// Fold column `c` into `c + 1` and remove it. `merge` decides what the
+    /// surviving cell says, given the row index and the two cells' text.
+    fn collapse(&mut self, c: usize, mut merge: impl FnMut(usize, &str, &str) -> String) {
+        for (ri, row) in self.text.iter_mut().enumerate() {
+            if c + 1 >= row.len() {
+                continue;
+            }
+            let a = row[c].trim().to_string();
+            let b = row[c + 1].trim().to_string();
+            row[c + 1] = merge(ri, &a, &b);
+        }
+        for row in self.boxes.iter_mut() {
+            if c + 1 < row.len() {
+                row[c + 1] = union(row[c], row[c + 1]);
+            }
+            if c < row.len() {
+                row.remove(c);
+            }
+        }
+        for row in self.text.iter_mut() {
+            if c < row.len() {
+                row.remove(c);
+            }
+        }
+    }
+
+    /// Fold the top row into the one beneath it and remove it.
+    fn collapse_top_row(&mut self, sep: &str) {
+        let top = self.text.remove(0);
+        let top_boxes = self.boxes.remove(0);
+        for (i, t) in top.into_iter().enumerate() {
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(cell) = self.text[0].get_mut(i) {
+                *cell = if cell.trim().is_empty() {
+                    t.to_string()
+                } else {
+                    format!("{t}{sep}{}", cell.trim())
+                };
+            }
+        }
+        for (i, b) in top_boxes.into_iter().enumerate() {
+            if let Some(cell) = self.boxes[0].get_mut(i) {
+                *cell = union(b, *cell);
+            }
+        }
+    }
 }
 
 /// Group words into lines by vertical overlap. Poppler emits reading-order
@@ -348,9 +440,13 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
     if cols.len() < 2 {
         return None;
     }
-    let mut grid = Vec::with_capacity(rows.len());
+    let mut g = Grid { text: Vec::with_capacity(rows.len()), boxes: Vec::with_capacity(rows.len()) };
     for l in rows {
         let mut cells = vec![String::new(); cols.len()];
+        // The box is the union of the words that landed in the cell, not the
+        // corridor it was assigned to: a corridor is a gap in the whole block,
+        // and citing it would point at whitespace the value does not occupy.
+        let mut boxes: Vec<Option<Rect>> = vec![None; cols.len()];
         for w in &l.words {
             let mid = (w.x0 + w.x1) * 0.5;
             // nearest column by midpoint, so a word overhanging its cell still lands right
@@ -368,34 +464,31 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
                 cells[ci].push(' ');
             }
             cells[ci].push_str(&w.text);
+            boxes[ci] = union(boxes[ci], Some([w.x0, w.y0, w.x1, w.y1]));
         }
-        grid.push(cells);
+        g.text.push(cells);
+        g.boxes.push(boxes);
     }
     // A column that carries a header and no data at all is a label stranded by
     // a corridor: its values are in the column beside it. Send the label there
     // rather than leaving a phantom column and an unlabelled one.
-    if grid.len() > 2 {
+    if g.text.len() > 2 {
         let mut c = 0;
-        while c < grid[0].len() && grid[0].len() > 1 {
-            let empty_body = grid
+        while c < g.ncol() && g.ncol() > 1 {
+            let empty_body = g
+                .text
                 .iter()
                 .skip(1)
                 .all(|r| r.get(c).is_none_or(|v| v.trim().is_empty()));
-            let label = grid[0].get(c).map(|v| v.trim().to_string()).unwrap_or_default();
-            if empty_body && !label.is_empty() && c + 1 < grid[0].len() {
-                let next = grid[0][c + 1].trim().to_string();
-                grid[0][c + 1] = if next.is_empty() { label } else { format!("{label} {next}") };
-                for r in grid.iter_mut() {
-                    if c < r.len() {
-                        r.remove(c);
-                    }
-                }
+            let label = g.text[0].get(c).map(|v| v.trim().to_string()).unwrap_or_default();
+            if empty_body && !label.is_empty() && c + 1 < g.ncol() {
+                g.collapse(c, |ri, a, b| match (ri, b.is_empty()) {
+                    (0, true) => a.to_string(),
+                    (0, false) => format!("{a} {b}"),
+                    _ => b.to_string(),
+                });
             } else if empty_body && label.is_empty() {
-                for r in grid.iter_mut() {
-                    if c < r.len() {
-                        r.remove(c);
-                    }
-                }
+                g.collapse(c, |_, _, b| b.to_string());
             } else {
                 c += 1;
             }
@@ -413,40 +506,33 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
     // same row. Tolerate a few — a "Head Lease" row legitimately carries a term
     // phrase beside an N/A — but not a majority.
     let mut c = 0;
-    while c + 1 < grid.first().map(|r| r.len()).unwrap_or(0) {
-        let has_hdr = grid.len() > 2;
+    while c + 1 < g.ncol() {
+        let has_hdr = g.text.len() > 2;
         let skip = usize::from(has_hdr);
         let filled = |r: &Vec<String>, i: usize| r.get(i).is_some_and(|v| !v.trim().is_empty());
-        let n = grid.len() - skip;
-        let both = grid.iter().skip(skip).filter(|r| filled(r, c) && filled(r, c + 1)).count();
-        let left = grid.iter().skip(skip).filter(|r| filled(r, c)).count();
-        let right = grid.iter().skip(skip).filter(|r| filled(r, c + 1)).count();
+        let n = g.text.len() - skip;
+        let both = g.text.iter().skip(skip).filter(|r| filled(r, c) && filled(r, c + 1)).count();
+        let left = g.text.iter().skip(skip).filter(|r| filled(r, c)).count();
+        let right = g.text.iter().skip(skip).filter(|r| filled(r, c + 1)).count();
 
         if left > 0 && right > 0 && both * 10 <= n {
             // Both header cells named something. The first names the column
             // being merged; the second belongs to the column after it, which is
             // where its data actually sits.
             let mut displaced: Option<String> = None;
-            for (ri, r) in grid.iter_mut().enumerate() {
-                if c + 1 >= r.len() {
-                    continue;
-                }
-                let a = r[c].trim().to_string();
-                let b = r[c + 1].trim().to_string();
+            g.collapse(c, |ri, a, b| {
                 if ri == 0 && has_hdr && !a.is_empty() && !b.is_empty() {
-                    displaced = Some(b);
-                    r[c + 1] = a;
-                } else {
-                    r[c + 1] = match (a.is_empty(), b.is_empty()) {
-                        (true, _) => b,
-                        (_, true) => a,
-                        _ => format!("{a} {b}"),
-                    };
+                    displaced = Some(b.to_string());
+                    return a.to_string();
                 }
-                r.remove(c);
-            }
+                match (a.is_empty(), b.is_empty()) {
+                    (true, _) => b.to_string(),
+                    (_, true) => a.to_string(),
+                    _ => format!("{a} {b}"),
+                }
+            });
             if let Some(d) = displaced {
-                if let Some(h) = grid.first_mut().and_then(|r| r.get_mut(c + 1)) {
+                if let Some(h) = g.text.first_mut().and_then(|r| r.get_mut(c + 1)) {
                     *h = if h.trim().is_empty() { d } else { format!("{d} {}", h.trim()) };
                 }
             }
@@ -459,13 +545,12 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
     // against a right-aligned figure, so a corridor opens between them and "$"
     // becomes a column of its own: `| $ | 20.08 |`. Fold any column whose every
     // entry is a bare symbol into the one after it.
-    let ncols = grid.first().map(|r| r.len()).unwrap_or(0);
     let mut c = 0;
-    while c + 1 < grid.first().map(|r| r.len()).unwrap_or(0) {
+    while c + 1 < g.ncol() {
         // Judge on the body only: the header cell above a "$" column holds the
         // measure's name ("Base", "Year"), which would otherwise disqualify it.
-        let skip = usize::from(grid.len() > 2);
-        let entries: Vec<&String> = grid.iter().skip(skip).filter_map(|r| r.get(c)).collect();
+        let skip = usize::from(g.text.len() > 2);
+        let entries: Vec<&String> = g.text.iter().skip(skip).filter_map(|r| r.get(c)).collect();
         // Tolerate a minority of stragglers: a wrapped header fragment or a
         // footnote marker can land in the symbol column without making it a
         // real column of data.
@@ -476,30 +561,26 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
             .count();
         let symbolic = filled.len() >= 2 && syms * 5 >= filled.len() * 4;
         if symbolic {
-            for r in grid.iter_mut() {
-                let sym = r[c].trim().to_string();
-                if !sym.is_empty() && !r[c + 1].trim().is_empty() {
-                    r[c + 1] = format!("{sym}{}", r[c + 1].trim());
-                } else if !sym.is_empty() {
-                    r[c + 1] = sym;
-                }
-                r.remove(c);
-            }
+            g.collapse(c, |_, sym, b| match (sym.is_empty(), b.is_empty()) {
+                (true, _) => b.to_string(),
+                (_, true) => sym.to_string(),
+                _ => format!("{sym}{b}"),
+            });
         } else {
             c += 1;
         }
     }
-    let _ = ncols;
 
     // A table whose rows are nearly all single-cell is really prose. Count rows,
     // not cells: a statement's section labels ("Income", "Cost of Goods Sold")
     // each occupy one cell legitimately, and summing cells lets a handful of them
     // drag a perfectly good P&L below the bar and back into a paragraph.
-    let multi = grid
+    let multi = g
+        .text
         .iter()
         .filter(|r| r.iter().filter(|c| !c.trim().is_empty()).count() >= 2)
         .count();
-    if multi * 2 < grid.len() {
+    if multi * 2 < g.text.len() {
         return None;
     }
     // Two-tier headers. A wide table bands its columns under a spanning banner —
@@ -514,10 +595,10 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
     // fully populated and carries no figures, over rows that do. Fold the banner
     // INTO the labels rather than dropping either: `Tenant Profile / Tenant`
     // keeps the grouping without costing the field its name.
-    if grid.len() > 3 {
-        let ncol = grid[0].len();
-        let blank_head = grid[0].iter().filter(|c| c.trim().is_empty()).count();
-        let filled = grid[1].iter().filter(|c| !c.trim().is_empty()).count();
+    if g.text.len() > 3 {
+        let ncol = g.ncol();
+        let blank_head = g.text[0].iter().filter(|c| c.trim().is_empty()).count();
+        let filled = g.text[1].iter().filter(|c| !c.trim().is_empty()).count();
         let numeric_row = |r: &Vec<String>| r.iter().any(|c| numeric_cell(c));
         // A column label is a name. `Total per Unit`, `Unit Area (SF)`, `% of
         // NRA` all qualify; `1 2 of 14` does not, and neither does a DocuSign
@@ -530,27 +611,15 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
         let wordy = |r: &Vec<String>| !r.iter().any(|c| c.chars().any(|ch| ch.is_ascii_digit()));
         let banded = blank_head * 5 >= ncol * 2      // banner leaves most cells empty
             && filled * 10 >= ncol * 7               // labels fill their row
-            && wordy(&grid[1])                       // …and are labels, not data
-            && grid.iter().skip(2).any(numeric_row); // …over something measured
+            && wordy(&g.text[1])                          // …and are labels, not data
+            && g.text.iter().skip(2).any(numeric_row);    // …over something measured
         if banded {
-            for (i, top) in grid.remove(0).into_iter().enumerate() {
-                let top = top.trim();
-                if top.is_empty() {
-                    continue;
-                }
-                match grid[0].get_mut(i) {
-                    Some(cell) if !cell.trim().is_empty() => {
-                        *cell = format!("{top} / {}", cell.trim());
-                    }
-                    Some(cell) => *cell = top.to_string(),
-                    None => {}
-                }
-            }
+            g.collapse_top_row(" / ");
         }
     }
 
-    let header = rows.first().is_some_and(|l| l.bold()) || grid.len() > 2;
-    Some(Table { rows: grid, header })
+    let header = rows.first().is_some_and(|l| l.bold()) || g.text.len() > 2;
+    Some(Table { rows: g.text, boxes: g.boxes, header })
 }
 
 /// A cell that reads as a figure rather than a label. Deliberately loose:
@@ -1001,6 +1070,45 @@ mod tests {
         assert_eq!(t.rows[0][2], "Profile / Tenant");
         assert_eq!(t.rows[0][3], "Area");
         assert_eq!(t.rows[1][0], "B", "the data must still start at row 1");
+    }
+
+    #[test]
+    fn a_folded_column_keeps_the_box_of_what_it_absorbed() {
+        // The "$" column folds into the figure beside it. The surviving cell
+        // says "$49.00", so its box has to cover both — cite only the digits
+        // and a reader checking the citation finds the currency symbol absent
+        // from the place the value claims to come from.
+        let h = line(7.0, &[(0.0, 20.0, "Unit"), (120.0, 150.0, "Rent")]);
+        let r1 = line(7.0, &[(0.0, 20.0, "506"), (100.0, 106.0, "$"), (120.0, 150.0, "49.00")]);
+        let r2 = line(7.0, &[(0.0, 20.0, "512"), (100.0, 106.0, "$"), (120.0, 150.0, "68.00")]);
+        let r3 = line(7.0, &[(0.0, 20.0, "500"), (100.0, 106.0, "$"), (120.0, 150.0, "41.00")]);
+        let t = build_table(&[&h, &r1, &r2, &r3]).expect("should build a table");
+        let last = t.rows[1].len() - 1;
+        assert_eq!(t.rows[1][last], "$49.00");
+        let b = t.boxes[1][last].expect("a cell with text has a box");
+        assert!(b[0] <= 100.0, "box must start at the $, not the digits: {b:?}");
+        assert!(b[2] >= 150.0, "box must reach the end of the figure: {b:?}");
+    }
+
+    #[test]
+    fn geometry_keeps_the_shape_of_the_text() {
+        // Every repair that removes a column has to remove it from both, or a
+        // cell cites the box of its neighbour — a citation to the wrong value,
+        // which is worse than no citation at all.
+        let h = line(7.0, &[(0.0, 20.0, "Unit"), (120.0, 150.0, "Rent")]);
+        let r1 = line(7.0, &[(0.0, 20.0, "506"), (100.0, 106.0, "$"), (120.0, 150.0, "49.00")]);
+        let r2 = line(7.0, &[(0.0, 20.0, "512"), (100.0, 106.0, "$"), (120.0, 150.0, "68.00")]);
+        let r3 = line(7.0, &[(0.0, 20.0, "500"), (120.0, 150.0, "41.00")]);
+        let t = build_table(&[&h, &r1, &r2, &r3]).expect("should build a table");
+        assert_eq!(t.boxes.len(), t.rows.len());
+        for (r, b) in t.rows.iter().zip(t.boxes.iter()) {
+            assert_eq!(r.len(), b.len(), "row {r:?} and its boxes disagree on width");
+            for (cell, box_) in r.iter().zip(b.iter()) {
+                if cell.trim().is_empty() {
+                    assert!(box_.is_none(), "an empty cell must not claim a box");
+                }
+            }
+        }
     }
 
     #[test]

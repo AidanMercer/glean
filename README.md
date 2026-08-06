@@ -55,6 +55,7 @@ glean report.pdf                     # Markdown to stdout
 glean report.pdf -o report.md        # or to a file
 glean report.pdf -p 32,74 -j 8       # only these pages, 8 threads
 glean report.pdf --json              # page-addressable JSON
+glean report.pdf --json --cells      # …with a ref and a box per table cell
 glean report.pdf --images ./figs     # extract embedded images as PNG
 glean report.pdf --images ./figs --figures   # also rasterise vector charts
 glean report.pdf --ocr-pages ./scans # write the scanned pages out for OCR
@@ -101,6 +102,36 @@ the classifier could tell them apart.
 `full_markdown` is the same string the Markdown mode writes, front matter and
 page marks included when those flags are set. `pages` is the length of the
 **document**; `pages_included` is how much of it is in this output.
+
+### Cell provenance
+
+`--cells` gives every table cell a page-anchored ref and the box it occupies:
+
+```json
+"tables": [{"table": 1, "rows": 62, "cols": 21, "cells": [
+  {"ref": "p2!t1!r5c8", "row": 5, "col": 8, "text": "$1,905",
+   "bbox": [355.1, 128.4, 379.6, 135.6]}
+]}]
+```
+
+A value pulled out of a spreadsheet can say it came from `Sheet1!B12`. A value
+pulled out of a PDF could only ever say "page 4" — so anything checking the
+extraction had to search the whole page for it, and a figure that appears twice
+on that page could not be told apart. `r5c8` is the same class of citation, and
+the box lets a reader go and look.
+
+Rows and columns are 1-based and address the table **as emitted** — after
+padding, blank rows and blank edge columns are gone — because that is the grid
+the reader is looking at. Row 1 is the header. Empty cells are omitted: they
+hold nothing to cite, and a box invented for them would be invented evidence.
+
+Checked by cropping each box out of the PDF with `pdftotext` — a different code
+path from the one glean builds its grid with — **1,826 of 1,841 sampled cells
+(99.2%) contain the text they claim to**. The residue is DocuSign overlay
+artifacts whose text `pdftotext` will not return from any crop.
+
+Opt-in, because it is several cells of JSON per value and no use to a consumer
+that only wants the prose.
 
 ### Images
 
@@ -218,7 +249,7 @@ not be captured.
 cargo test
 ```
 
-Twenty-six tests pin the layout heuristics and the front matter, each one
+Twenty-eight tests pin the layout heuristics and the front matter, each one
 standing on a bug that actually shipped:
 
 - tracking repair and both failure directions — a two-piece letter split must
@@ -237,6 +268,8 @@ standing on a bug that actually shipped:
 - a banner row does not take the column labels' place — and a banner over real
   data is left alone
 - a scan renders at its own resolution; a thumbnail does not drag it up
+- a folded column keeps the box of what it absorbed, and the geometry keeps the
+  shape of the text through every repair
 
 ### Feeding an LLM
 

@@ -7,38 +7,68 @@
 //!   2. Never silently weld two cells together. Escaping and cell padding are
 //!      cheap; a fused "$5,120,000480" that reads as a real number is not.
 
-use crate::layout::{Block, Line, Table};
+use crate::layout::{Block, Line, Rect, Table};
 
 fn escape_cell(s: &str) -> String {
     s.replace('\\', "\\\\").replace('|', "\\|").replace('\n', " ")
 }
 
-fn write_table(out: &mut String, t: &Table) {
+/// A table in the shape it is actually emitted in: padded to a rectangle, with
+/// blank rows and blank edge columns dropped.
+///
+/// Provenance is computed against THIS, never against the built table. A cell's
+/// row and column only mean anything in the grid the reader is looking at, and
+/// the two disagree by however many empty edge columns were trimmed — a citation
+/// off by one column is a citation to the wrong value, which is worse than none.
+pub struct Norm {
+    pub rows: Vec<Vec<String>>,
+    pub boxes: Vec<Vec<Option<Rect>>>,
+    pub header: bool,
+    /// Too thin to be a table: emitted as plain text, and worth no citations.
+    pub degenerate: bool,
+}
+
+pub fn normalise(t: &Table) -> Option<Norm> {
     let ncol = t.rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if ncol < 2 || t.rows.is_empty() {
-        return;
+        return None;
     }
     let mut rows = t.rows.clone();
-    for r in &mut rows {
+    let mut boxes = t.boxes.clone();
+    boxes.resize(rows.len(), Vec::new());
+    for (r, b) in rows.iter_mut().zip(boxes.iter_mut()) {
         r.resize(ncol, String::new());
+        b.resize(ncol, None);
     }
     // Drop wholly empty rows and edge columns — artefacts of a wide margin or a
     // rule line, and pure noise in an LLM's context window.
-    rows.retain(|r| r.iter().any(|c| !c.trim().is_empty()));
+    let keep: Vec<bool> =
+        rows.iter().map(|r| r.iter().any(|c| !c.trim().is_empty())).collect();
+    let mut i = 0;
+    rows.retain(|_| { i += 1; keep[i - 1] });
+    let mut i = 0;
+    boxes.retain(|_| { i += 1; keep[i - 1] });
     if rows.is_empty() {
-        return;
+        return None;
     }
     while rows[0].len() > 2 && rows.iter().all(|r| r[0].trim().is_empty()) {
         for r in &mut rows {
             r.remove(0);
+        }
+        for b in &mut boxes {
+            if !b.is_empty() {
+                b.remove(0);
+            }
         }
     }
     while rows[0].len() > 2 && rows.iter().all(|r| r.last().is_some_and(|c| c.trim().is_empty())) {
         for r in &mut rows {
             r.pop();
         }
+        for b in &mut boxes {
+            b.pop();
+        }
     }
-    let ncol = rows[0].len();
 
     // A table with no header text and barely any body is a layout accident — an
     // empty ruled box, or a stray pair of aligned words. Emitting `| | |` puts
@@ -48,7 +78,14 @@ fn write_table(out: &mut String, t: &Table) {
         .filter(|r| r.iter().filter(|c| !c.trim().is_empty()).count() >= 2)
         .count();
     let header_blank = rows[0].iter().all(|c| c.trim().is_empty());
-    if substantive < 2 || (header_blank && substantive < 3) {
+    let degenerate = substantive < 2 || (header_blank && substantive < 3);
+    Some(Norm { rows, boxes, header: t.header, degenerate })
+}
+
+fn write_table(out: &mut String, t: &Table) {
+    let Some(n) = normalise(t) else { return };
+    let rows = n.rows;
+    if n.degenerate {
         for r in &rows {
             let line = r.iter().map(|c| c.trim()).filter(|c| !c.is_empty())
                 .collect::<Vec<_>>().join(" ");
@@ -59,8 +96,9 @@ fn write_table(out: &mut String, t: &Table) {
         }
         return;
     }
+    let ncol = rows[0].len();
 
-    let (head, body): (&[Vec<String>], &[Vec<String>]) = if t.header && rows.len() > 1 {
+    let (head, body): (&[Vec<String>], &[Vec<String>]) = if n.header && rows.len() > 1 {
         (&rows[..1], &rows[1..])
     } else {
         (&[], &rows[..])
