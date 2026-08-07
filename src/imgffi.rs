@@ -224,17 +224,28 @@ pub const THIN_FIGURE_MIN: f64 = 0.10;
 /// safe direction: the cost of being wrong is one page of OCR, and the cost of
 /// the opposite is a table nobody knows is missing.
 ///
-/// Vector ink is deliberately not consulted. A chart drawn with path operators
-/// carries its labels in the text layer, so a page holding one is not text-free
-/// in the first place and never reaches here.
-pub fn classify_thin(page: usize, w: f64, h: f64, imgs: &[Image]) -> PageKind {
+/// VECTOR INK COUNTS, and assuming otherwise cost 8 of 9 misses on the first
+/// unseen document set. The original reasoning — "a chart drawn with path
+/// operators carries its labels in the text layer, so such a page is not
+/// text-free and never reaches here" — is simply false for a PDF whose text has
+/// been converted to outlines. An appraisal exported that way has pages
+/// carrying 51 characters of running head, NO raster at all, and 87–145 words
+/// that only OCR can see. Nothing about the page is a picture; the letters are
+/// curves.
+///
+/// So the rule is: on a page with no text of its own, anything drawn on it is
+/// its content. Rasters have to clear a size bar because a plate of small photos
+/// is a plate of photos; ink does not, because ink with no text beside it has no
+/// benign reading. A page with neither stays Text — a title over nothing is not
+/// a hole.
+pub fn classify_thin(page: usize, w: f64, h: f64, imgs: &[Image], ink: &[usize]) -> PageKind {
     let cover: f64 = imgs
         .iter()
         .filter(|i| i.page == page)
         .filter(|i| i.page_fraction(w, h) >= THIN_FIGURE_MIN)
         .map(|i| i.page_fraction(w, h))
         .sum();
-    if cover.min(1.0) >= THIN_IMAGE_COVERAGE {
+    if cover.min(1.0) >= THIN_IMAGE_COVERAGE || ink.contains(&page) {
         PageKind::Scan
     } else {
         PageKind::Text

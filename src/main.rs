@@ -404,11 +404,12 @@ fn main() -> ExitCode {
         // Both are needed: the chrome set catches a repeated header, and
         // `is_furniture` catches the footer whose page number keeps it out of
         // that set.
-        bare[slot] = lines
+        let own: Vec<&layout::Line> = lines
             .iter()
             .filter(|l| !chrome.contains(l.text().trim()) && !layout::is_furniture(l, *ph, body))
-            .map(|l| l.words.len())
-            .sum();
+            .collect();
+        bare[slot] = own.iter().map(|l| l.words.len()).sum();
+
     }
 
     // Typical page, measured over the pages that carry prose at all — including
@@ -446,7 +447,7 @@ fn main() -> ExitCode {
                     // Blank or Image: this page holds words, and a survey must
                     // not deny text we are already carrying.
                     let k = if thin_set.contains(&slot) {
-                        imgffi::classify_thin(page, w, h, &imgs)
+                        imgffi::classify_thin(page, w, h, &imgs, &ink)
                     } else {
                         imgffi::classify(page, w, h, &imgs, &ink)
                     };
@@ -963,11 +964,11 @@ mod tests {
         // A logo and a banner must not carry a page over the bar on their own.
         let logo = img(2, 0.0, 0.0, 40.0, 40.0);
         let banner = img(2, 0.0, 700.0, 300.0, 760.0);
-        assert_eq!(imgffi::classify_thin(2, 612.0, 792.0, &[logo, banner]), PageKind::Text);
+        assert_eq!(imgffi::classify_thin(2, 612.0, 792.0, &[logo, banner], &[]), PageKind::Text);
         // Map plus that furniture clears it — the figure is what the page holds.
         let logo1 = img(1, 0.0, 0.0, 40.0, 40.0);
         assert_eq!(
-            imgffi::classify_thin(1, 612.0, 792.0, &[map, logo1]),
+            imgffi::classify_thin(1, 612.0, 792.0, &[map, logo1], &[]),
             PageKind::Scan
         );
     }
@@ -983,20 +984,20 @@ mod tests {
         };
         let plate: Vec<Image> = (0..6).map(tile).collect();
         assert!(plate[0].page_fraction(612.0, 792.0) < imgffi::THIN_FIGURE_MIN);
-        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &plate), PageKind::Text);
+        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &plate, &[]), PageKind::Text);
 
         let chart = |y0: f64, y1: f64, w: u32| Image {
             page: 1, x0: 60.0, y0, x1: 552.0, y1, w, h: 800, path: String::new(),
         };
         let charts = vec![chart(400.0, 690.0, 900), chart(120.0, 310.0, 901)];
-        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &charts), PageKind::Scan);
+        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &charts, &[]), PageKind::Scan);
     }
 
     #[test]
     fn a_thin_page_is_never_demoted_to_blank() {
         // A title over nothing at all holds words we already have. Promotion is
         // the only direction available, so this stays Text and its title is kept.
-        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &[]), PageKind::Text);
+        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &[], &[]), PageKind::Text);
     }
 
     #[test]
