@@ -19,6 +19,7 @@ struct GImage {
 enum GImages {}
 
 extern "C" {
+    fn glean_init();
     fn glean_images(
         pdf: *const c_char,
         outdir: *const c_char,
@@ -110,6 +111,14 @@ impl PageKind {
 /// scanned appendices land at 0.86–0.94 of the page box.
 pub const SCAN_COVERAGE: f64 = 0.5;
 
+/// Initialise poppler's process-wide state before any worker thread exists.
+/// See the note on `glean_init` in images.cpp — poppler-cpp races its own
+/// lazy `globalParams` construction across threads, and this is what closes it.
+/// Idempotent; call it once from main.
+pub fn init() {
+    unsafe { glean_init() };
+}
+
 /// Where every raster sits, and which pages carry path ink — without decoding a
 /// pixel or writing a file. Used to classify the pages that produced no words.
 pub fn probe(pdf: &str, first: usize, last: usize) -> Result<(Vec<Image>, Vec<usize>), String> {
@@ -159,6 +168,77 @@ pub fn classify(page: usize, w: f64, h: f64, imgs: &[Image], ink: &[usize]) -> P
         return PageKind::Image;
     }
     PageKind::Blank
+}
+
+/// How much of a text-free page must be picture before the picture is the page.
+/// A quarter clears a corner logo and a masthead banner and nothing else.
+pub const THIN_IMAGE_COVERAGE: f64 = 0.25;
+
+/// An image smaller than this is an illustration ON a page, never the content OF
+/// one. Six photographs tiled at 7% apiece sum past any coverage bar while being
+/// exactly the plate of site photos that must NOT be sent to OCR; two stacked
+/// charts at 23% and 15% are a page of data that must be. Summing without a
+/// floor cannot tell those apart, and the floor is what does.
+///
+/// Set between the two observed cases and nearer the SMALLER one: the cost of
+/// admitting a photo plate is one page of OCR, and the cost of excluding a chart
+/// is the chart. 0.07 (plate) and 0.15 (chart) are the measured neighbours.
+pub const THIN_FIGURE_MIN: f64 = 0.10;
+
+// ⚠ A "REPEATED GRAPHIC IS A TEMPLATE" RULE WAS TRIED HERE AND REVERTED ON
+// EVIDENCE. Do not re-add it keyed on dimensions.
+//
+// The idea is sound and the target is real: an appraisal carries a
+// section-divider illustration at 67% of the page on five pages, which clears
+// every coverage bar and is worth nothing to OCR. Every genuine content image in
+// that document (a location map, four photocopied zoning tables, two charts)
+// appears exactly once, so "appears on 3+ pages ⇒ furniture" separated them
+// perfectly on the corpus it was written against.
+//
+// It also silently DELETED 462 scanned pages across 100 documents of the wider
+// corpus, because the probe has no pixel identity — only dimensions — and the
+// pages of a scanned document all share dimensions. A DocuSign-stamped scanned
+// lease is a text layer of envelope ids over N full-page rasters of identical
+// size, which is indistinguishable from N placements of one graphic. The rule
+// read a 35-page scanned Certificate of Corporate Authority as decoration.
+//
+// It cannot be rescued by thresholds: the divider (0.67) sits inside the
+// coverage range real page scans occupy, so no size band separates them. The
+// only correct version needs the probe to carry a content hash, which is an FFI
+// change (glean_images_probe would have to digest each image's bytes). Until
+// then the false positives it would have removed cost about $0.05 per 500 pages,
+// and the false negatives it created cost a rent roll.
+
+/// The kind of a page whose only text is running furniture.
+///
+/// On an ordinary page a figure is a figure: the text is the content and the
+/// picture illustrates it, so `classify` reasonably reserves `Scan` for a raster
+/// that covers the sheet. On a page with no text but a header that reasoning
+/// inverts — the figure IS the content, and whether it covers 59% (a zoning
+/// bylaw photocopied into an appraisal) or 35% (a location map with the
+/// demographics printed inside it) makes no difference to the only question
+/// worth asking: can anything read it without OCR.
+///
+/// Coverage is summed across the page's images and capped, so overlapping
+/// figures double-count. That errs toward calling a page pictorial, which is the
+/// safe direction: the cost of being wrong is one page of OCR, and the cost of
+/// the opposite is a table nobody knows is missing.
+///
+/// Vector ink is deliberately not consulted. A chart drawn with path operators
+/// carries its labels in the text layer, so a page holding one is not text-free
+/// in the first place and never reaches here.
+pub fn classify_thin(page: usize, w: f64, h: f64, imgs: &[Image]) -> PageKind {
+    let cover: f64 = imgs
+        .iter()
+        .filter(|i| i.page == page)
+        .filter(|i| i.page_fraction(w, h) >= THIN_FIGURE_MIN)
+        .map(|i| i.page_fraction(w, h))
+        .sum();
+    if cover.min(1.0) >= THIN_IMAGE_COVERAGE {
+        PageKind::Scan
+    } else {
+        PageKind::Text
+    }
 }
 
 /// Bounds on the resolution a scan is re-rendered at. Below the floor OCR loses

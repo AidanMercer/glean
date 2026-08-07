@@ -20,7 +20,11 @@ Usage:
 Options:
   -o, --output <path>   write Markdown to <path> instead of stdout
   -p, --pages <spec>    only these pages, 1-based (e.g. 3, 5-9, 2,7,11-14)
-  -j, --jobs <n>        worker threads (default: available parallelism)
+  -j, --jobs <n>        worker threads (default 1). ⚠ n>1 is FASTER BUT NOT
+                        SAFE: poppler's process-wide state races across glean's
+                        workers and crashes about 1 document in 300, reporting
+                        it as \"could not open\". Run several glean processes
+                        instead — that shares nothing.
       --json            emit {pages:[{page,anchor,kind,markdown}], full_markdown}
       --images <dir>    extract embedded images to <dir> as PNG
       --min-image <px>  smallest image side to keep (default 64)
@@ -133,7 +137,20 @@ fn parse_args() -> Result<Args, String> {
         input: String::new(),
         output: None,
         pages: None,
-        jobs: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+        // ONE by default, and that is a correctness decision, not a conservative
+        // guess. See the note on OPEN_LOCK in ffi.rs: poppler's process-wide
+        // state is not safe against glean's own workers, and the failure is a
+        // SIGSEGV that prints "could not open <file>" — indistinguishable from an
+        // encrypted PDF, so a lost document looks like a bad document. Measured
+        // at 1–4 losses per 2,248 conversions with threads, 0 in 4,496 without.
+        //
+        // The cost is small and bounded: on the largest document in the corpus
+        // (1,114 pages) single-threaded takes 7.2s against 4.9s at -j 16, and
+        // that document's scanned pages alone are minutes of OCR. Ordinary deal
+        // documents are tens of pages, where the difference is milliseconds.
+        // Throughput over a folder comes from running several glean PROCESSES,
+        // which shares nothing and is safe.
+        jobs: 1,
         stats: false,
         keep_chrome: false,
         front_matter: false,
@@ -214,6 +231,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Before ANY document is opened and long before the workers spawn. poppler
+    // constructs its process-wide `globalParams` lazily and unlocked, so N
+    // threads opening N documents on a cold process race to build it and free
+    // each other's — a SIGSEGV in roughly 1 document in 300 at -P 12, and never
+    // once running serially. Doing it here means every later check finds it set.
+    imgffi::init();
 
     let doc = match ffi::Doc::open(&args.input) {
         Ok(d) => d,
@@ -296,21 +320,35 @@ fn main() -> ExitCode {
 
     // A single page has no "across pages" to compare against, and two is not
     // evidence either; below that threshold nothing is suppressed.
-    let chrome = if args.keep_chrome || wanted.len() < 4 {
+    //
+    // Detected ALWAYS, suppressed only when asked. `--keep-chrome` is an output
+    // choice, and a page's NATURE must not change with one: the thin-page test
+    // below asks "is anything here but the running head", and if that question
+    // answered differently under a print flag, the same document would bill
+    // differently for OCR depending on how it was asked to render.
+    // Document-level body size: a per-page estimate is dragged around by
+    // whatever that page happens to contain. Needed by both the chrome set and
+    // the furniture test below, so it is computed once for the document.
+    let body = {
+        let mut sizes: Vec<f64> = pages
+            .iter()
+            .flat_map(|(ls, _)| ls.iter().map(|l| l.size))
+            .collect();
+        layout::median(&mut sizes)
+    };
+    let chrome = if wanted.len() < 4 {
         std::collections::HashSet::new()
     } else {
         // A running head need not be on every page — a report's appendices often
         // carry a different one, or none. An eighth of the document is enough
         // evidence when combined with the margin and same-band requirements,
         // which body text essentially never satisfies.
-        // Document-level body size: a per-page estimate is dragged around by
-        // whatever that page happens to contain.
-        let mut sizes: Vec<f64> = pages
-            .iter()
-            .flat_map(|(ls, _)| ls.iter().map(|l| l.size))
-            .collect();
-        let body = layout::median(&mut sizes);
         layout::running_chrome(&pages, (wanted.len() / 4).max(5), body)
+    };
+    let drop_chrome = if args.keep_chrome {
+        std::collections::HashSet::new()
+    } else {
+        chrome.clone()
     };
 
     // Phase 2: serialise, dropping the chrome.
@@ -318,8 +356,37 @@ fn main() -> ExitCode {
     let mut kinds: Vec<imgffi::PageKind> = vec![imgffi::PageKind::Text; wanted.len()];
     let mut cells: Vec<Vec<TableCells>> = Vec::with_capacity(wanted.len());
     let (mut tables, mut words) = (0usize, 0usize);
+    // A heading is a LABEL for content, not content. "Location Overview" over a
+    // map with the demographics printed inside it leaves a page whose only real
+    // text is two words, and holding out for strictly zero would keep every such
+    // page — the standard CIM and appraisal furniture pages — out of the survey.
+    //
+    // The budget is a fraction of what a page of THIS document normally carries,
+    // not a fixed word count: "a tenth of a typical page" means the same thing in
+    // a dense lease and an airy CIM, where any constant is wrong in one of them.
+    // A flat twelve words missed a CIM page headed
+    // "Cameron Stephens Mortgage Capital Ltd. / Memnon Management Inc. — 235
+    // Carlaw Ave / Appendix B Rent Roll" — nineteen words of title over a rent
+    // roll that exists only as a picture. The floor keeps the rule from
+    // vanishing on a document of sparse pages.
+    const THIN_WORDS_FLOOR: usize = 12;
+    const THIN_SHARE: usize = 10;
+
+    // A page whose whole text layer is the running head is READABLE but says
+    // nothing — and what it says nothing about is usually a full-page image.
+    // An appraisal reproduces the zoning bylaw as a scanned insert; the text
+    // layer carries "Victoria Park, 370-382 Victoria Avenue" and "Page 65", and
+    // the bilingual table of provisions is pixels. Judged on `has_text` alone
+    // that page is Text, is never sent to OCR, and the provisions are lost with
+    // no warning — the worst failure available, because it is silent.
+    //
+    // So chrome-only pages are SURVEYED with the wordless ones. They are only
+    // ever promoted (to Scan), never demoted to Blank: words we hold are words
+    // we must not deny. Below the survey the promotion is narrowed further.
+    let mut thin: Vec<usize> = Vec::new();
+    let mut bare: Vec<usize> = vec![0; wanted.len()];
     for (slot, (lines, ph)) in pages.iter().enumerate() {
-        let (t, s, tc) = render_lines(lines, widths[slot], *ph, &chrome, args.cells);
+        let (t, s, tc) = render_lines(lines, widths[slot], *ph, &drop_chrome, args.cells);
         words += s.0;
         tables += s.1;
         out[slot] = t;
@@ -329,16 +396,43 @@ fn main() -> ExitCode {
         // billing the caller for OCR on our own suppression would be absurd.
         // Provisionally a scan — if the survey below cannot run, over-stating the
         // hole is the safe direction to be wrong in.
-        if lines.iter().map(|l| l.words.len()).sum::<usize>() == 0 {
+        let all: usize = lines.iter().map(|l| l.words.len()).sum();
+        if all == 0 {
             kinds[slot] = imgffi::PageKind::Scan;
+        }
+        // Everything that is not the running head and not margin furniture.
+        // Both are needed: the chrome set catches a repeated header, and
+        // `is_furniture` catches the footer whose page number keeps it out of
+        // that set.
+        bare[slot] = lines
+            .iter()
+            .filter(|l| !chrome.contains(l.text().trim()) && !layout::is_furniture(l, *ph, body))
+            .map(|l| l.words.len())
+            .sum();
+    }
+
+    // Typical page, measured over the pages that carry prose at all — including
+    // the near-empty ones would drag the median toward zero on exactly the
+    // documents this rule matters for.
+    let budget = {
+        let mut real: Vec<f64> = bare.iter().filter(|&&b| b > 0).map(|&b| b as f64).collect();
+        let med = layout::median(&mut real) as usize;
+        (med / THIN_SHARE).max(THIN_WORDS_FLOOR)
+    };
+    for (slot, b) in bare.iter().enumerate() {
+        if kinds[slot] == imgffi::PageKind::Text && *b <= budget {
+            thin.push(slot);
         }
     }
 
     // What each wordless page actually is. The survey costs one content-stream
     // walk with no pixel decoding, and only over the span that holds them — a
     // document with a text layer throughout never pays for it at all.
-    let wordless: Vec<usize> =
+    let mut wordless: Vec<usize> =
         (0..wanted.len()).filter(|&s| kinds[s] != imgffi::PageKind::Text).collect();
+    let thin_set: std::collections::HashSet<usize> = thin.iter().copied().collect();
+    wordless.extend(thin.iter().copied());
+    wordless.sort_unstable();
     let mut surveyed: Vec<imgffi::Image> = Vec::new();
     if !wordless.is_empty() {
         let lo = wanted[wordless[0]] + 1;
@@ -346,8 +440,20 @@ fn main() -> ExitCode {
         match imgffi::probe(&args.input, lo, hi) {
             Ok((imgs, ink)) => {
                 for &slot in &wordless {
-                    kinds[slot] =
-                        imgffi::classify(wanted[slot] + 1, widths[slot], pages[slot].1, &imgs, &ink);
+                    let (page, w, h) = (wanted[slot] + 1, widths[slot], pages[slot].1);
+                    // A thin page is judged on its own terms (see classify_thin)
+                    // and can only ever be PROMOTED to Scan. It is never called
+                    // Blank or Image: this page holds words, and a survey must
+                    // not deny text we are already carrying.
+                    let k = if thin_set.contains(&slot) {
+                        imgffi::classify_thin(page, w, h, &imgs)
+                    } else {
+                        imgffi::classify(page, w, h, &imgs, &ink)
+                    };
+                    if thin_set.contains(&slot) && k != imgffi::PageKind::Scan {
+                        continue;
+                    }
+                    kinds[slot] = k;
                 }
                 surveyed = imgs;
             }
@@ -480,8 +586,11 @@ fn main() -> ExitCode {
     // blank page is missing nothing, and rolling all three into one OCR bill was
     // this warning over-stating its own case.
     if !survey.scanned.is_empty() {
+        // "no readable text", not "no text layer": a page carrying a running
+        // head and a title over a full-page scan HAS a text layer, and this
+        // warning naming it a scan has to be true of that page too.
         eprintln!(
-            "glean: warning: {} of {} page(s) are scans with no text layer and were skipped; \
+            "glean: warning: {} of {} page(s) carry no readable text and were skipped; \
              they need OCR: {}",
             survey.scanned.len(), wanted.len(), fmt_ranges(&survey.scanned)
         );
@@ -542,9 +651,12 @@ fn front_matter(args: &Args, doc_pages: usize, wanted: &[usize], sv: &Survey) ->
     if !sv.scanned.is_empty() {
         s.push_str(&format!("unreadable_pages: {}\n", sv.scanned.len()));
         s.push_str(&format!("scanned_pages: {}\n", yq(&fmt_ranges(&sv.scanned))));
+        // A thin page contributes its title and nothing else, so "absent" would
+        // overstate it — but the CONTENT is absent, which is what a model asked
+        // to pull a fact off that page has to be told.
         warnings.push(format!(
-            "{} page(s) are scans with no text layer and are absent from this document; \
-             they require OCR: {}",
+            "{} page(s) carry no readable text and their content is absent from this \
+             document; they require OCR: {}",
             sv.scanned.len(),
             fmt_ranges(&sv.scanned)
         ));
@@ -837,6 +949,54 @@ mod tests {
         assert_eq!(classify(2, 612.0, 792.0, &[figure], &[]), PageKind::Image);
         // The same raster, asked about from a page it is not on.
         assert_eq!(classify(3, 612.0, 792.0, &[scan], &[]), PageKind::Blank);
+    }
+
+    #[test]
+    fn a_figure_on_a_text_free_page_is_the_page() {
+        // The 0.36-coverage map that is a FIGURE on a page of prose is the whole
+        // content of a page whose only text is "Location Overview" and a running
+        // head — the real one off the Victoria appraisal, demographics printed
+        // inside it. classify() reserves Scan for a full-bleed raster and is
+        // right to; classify_thin asks the other question.
+        let map = img(1, 80.0, 300.0, 530.0, 690.0);
+        assert_eq!(classify(1, 612.0, 792.0, std::slice::from_ref(&map), &[]), PageKind::Image);
+        // A logo and a banner must not carry a page over the bar on their own.
+        let logo = img(2, 0.0, 0.0, 40.0, 40.0);
+        let banner = img(2, 0.0, 700.0, 300.0, 760.0);
+        assert_eq!(imgffi::classify_thin(2, 612.0, 792.0, &[logo, banner]), PageKind::Text);
+        // Map plus that furniture clears it — the figure is what the page holds.
+        let logo1 = img(1, 0.0, 0.0, 40.0, 40.0);
+        assert_eq!(
+            imgffi::classify_thin(1, 612.0, 792.0, &[map, logo1]),
+            PageKind::Scan
+        );
+    }
+
+    #[test]
+    fn a_plate_of_photographs_is_not_a_scan() {
+        // Six site photos tiled at 7% each sum to 42% — past any coverage bar,
+        // and exactly the page that must not be billed for OCR. Two stacked
+        // charts at 23% and 15% sum to less and must be.
+        let tile = |n: usize| Image {
+            page: 1, x0: 0.0, y0: n as f64 * 60.0, x1: 160.0, y1: n as f64 * 60.0 + 130.0,
+            w: 400, h: 300, path: String::new(),
+        };
+        let plate: Vec<Image> = (0..6).map(tile).collect();
+        assert!(plate[0].page_fraction(612.0, 792.0) < imgffi::THIN_FIGURE_MIN);
+        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &plate), PageKind::Text);
+
+        let chart = |y0: f64, y1: f64, w: u32| Image {
+            page: 1, x0: 60.0, y0, x1: 552.0, y1, w, h: 800, path: String::new(),
+        };
+        let charts = vec![chart(400.0, 690.0, 900), chart(120.0, 310.0, 901)];
+        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &charts), PageKind::Scan);
+    }
+
+    #[test]
+    fn a_thin_page_is_never_demoted_to_blank() {
+        // A title over nothing at all holds words we already have. Promotion is
+        // the only direction available, so this stays Text and its title is kept.
+        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &[]), PageKind::Text);
     }
 
     #[test]

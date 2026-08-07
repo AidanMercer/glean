@@ -31,6 +31,7 @@
 #include <string>
 #include <array>
 #include <vector>
+#include <mutex>
 
 namespace {
 
@@ -223,7 +224,52 @@ public:
 
 } // namespace
 
+// poppler's `globalParams` is a GLOBAL std::unique_ptr, and every entry point
+// below used to assign it a fresh GlobalParams. Assigning to a unique_ptr
+// DESTROYS what it held — so the second call through this file freed the
+// instance the first call's PDFDoc and poppler-cpp document were still using,
+// and the third freed that one. It survives as long as nothing dereferences the
+// corpse, which is why it presented as a rare "double free or corruption
+// (!prev)" under load rather than a reliable crash, and why it grew more likely
+// the moment the page survey started running on documents that never probed
+// before.
+//
+// Create it once, never replace it. Mutexed because glean opens its own poppler
+// handle per worker thread and two of them can arrive here together.
+static void ensure_global_params()
+{
+    static std::mutex m;
+    std::lock_guard<std::mutex> lk(m);
+    if (!globalParams) globalParams = std::make_unique<GlobalParams>();
+}
+
+
 extern "C" {
+
+// Initialise poppler's process-wide state ONCE, on one thread, before any
+// worker exists.
+//
+// ⚠ THIS IS LOAD-BEARING AND IT IS NOT ABOUT THIS FILE. poppler-cpp's own
+// document_private constructor runs
+//
+//     if (!globalParams) globalParams = std::make_unique<GlobalParams>();
+//
+// with no lock. glean opens a separate document per worker thread on purpose
+// (poppler's PDFDoc is not thread-safe), so on a cold process N threads reach
+// that check together, all see null, and all construct — and each assignment to
+// the unique_ptr FREES the instance a sibling just installed and is already
+// using. It presents as a rare SIGSEGV or a glibc
+// "pthread_mutex_lock … assertion failed: e != ESRCH || !robust" under load,
+// never as a reliable failure, because it only bites when the timing lines up:
+// 7 crashes in 2,248 documents at -P 12, none at all running one at a time.
+//
+// Calling this before the first spawn makes every worker's check find a live
+// pointer and skip the construction entirely. It must stay a main-thread call;
+// moving it inside the workers restores the race.
+void glean_init()
+{
+    ensure_global_params();
+}
 
 struct GImage {
     int page;
@@ -272,7 +318,7 @@ static std::vector<std::array<double, 5>> cluster(std::vector<std::array<double,
 int glean_figures(const char *pdf, const char *outdir, int firstPage, int lastPage,
                   double minSidePts, double dpi, GImages *into)
 {
-    globalParams = std::make_unique<GlobalParams>();
+    ensure_global_params();
     auto core = std::make_unique<PDFDoc>(std::make_unique<GooString>(pdf));
     if (!core->isOk()) return 0;
 
@@ -356,7 +402,7 @@ int glean_figures(const char *pdf, const char *outdir, int firstPage, int lastPa
 int glean_render_pages(const char *pdf, const char *outdir, const int *pages, int n,
                        const double *dpis)
 {
-    globalParams = std::make_unique<GlobalParams>();
+    ensure_global_params();
     std::unique_ptr<poppler::document> pdoc(poppler::document::load_from_file(pdf));
     if (!pdoc) return 0;
 
@@ -402,7 +448,7 @@ int glean_render_pages(const char *pdf, const char *outdir, const int *pages, in
 
 GImages *glean_images(const char *pdf, const char *outdir, int firstPage, int lastPage, int minPx)
 {
-    globalParams = std::make_unique<GlobalParams>();
+    ensure_global_params();
     auto doc = std::make_unique<PDFDoc>(std::make_unique<GooString>(pdf));
     if (!doc->isOk()) return nullptr;
 
@@ -427,7 +473,7 @@ GImages *glean_images(const char *pdf, const char *outdir, int firstPage, int la
 // all, so the distinction is drawn here rather than guessed downstream.
 GImages *glean_images_probe(const char *pdf, int firstPage, int lastPage, int minPx)
 {
-    globalParams = std::make_unique<GlobalParams>();
+    ensure_global_params();
     auto doc = std::make_unique<PDFDoc>(std::make_unique<GooString>(pdf));
     if (!doc->isOk()) return nullptr;
 

@@ -195,11 +195,18 @@ fn merge_tracking(ws: Vec<Word>) -> Vec<Word> {
         // inter-word space is ~0.25em in most faces; tracking gaps land well
         // below that, and are often negative.
         let mut j = i + 1;
+        let mut widest = 0.0f64;
         while j < ws.len() {
             let (p, w) = (&ws[j - 1], &ws[j]);
             let em = p.size.max(w.size).max(1.0);
             let gap = w.x0 - p.x1;
             if gap < em * 0.16 && (w.ymid() - p.ymid()).abs() < em * 0.4 {
+                // Distance from zero, not the signed gap: letter-spacing runs
+                // slightly negative, but a LARGE negative gap means the pieces
+                // overlap or arrive out of order — two text runs stacked at the
+                // same x, not one split word. Signing this away once welded an
+                // address block into "Sainte-CatherineMontréal".
+                widest = widest.max((gap / em).abs());
                 j += 1;
             } else {
                 break;
@@ -213,15 +220,53 @@ fn merge_tracking(ws: Vec<Word>) -> Vec<Word> {
         // "Trade" — and merging those corrupts data rather than repairing it.
         // Two pieces may still join when both are themselves sub-word fragments.
         let n = j - i;
-        let piece = |w: &Word| w.text.chars().count() <= 2;
-        // A numeric piece is never a tracking fragment worth joining blind: that
-        // is how "$318" beside "12" became "$31812". Letters may join on a single
-        // stub ("Tota"+"l"), which tracking produces constantly.
-        let numeric = ws[i..j]
+        // A tracking fragment is a short run of LETTERS. A two-character stub
+        // that is digits is a cell, not a fragment — which is what keeps a
+        // right-aligned "$318" from adopting the "12" in the next column.
+        let piece = |w: &Word| {
+            w.text.chars().count() <= 2 && w.text.chars().all(char::is_alphabetic)
+        };
+        let two_ok = ws[i..j].iter().any(piece);
+        // The invention hazard is precise: a join that puts a digit against a
+        // digit mints a number that was never in the document ("$318" + "12" =
+        // "$31812"). Merely CONTAINING a digit is not the hazard, and treating
+        // it as one costs a real repair — a contents entry runs
+        // "D" + "EFINITIONS" + dot leader + "3", and rejecting the whole run for
+        // that trailing page number leaves the entry filed under "EFINITIONS".
+        let welds_digits = ws[i..j].windows(2).any(|p| {
+            p[0].text.chars().last().is_some_and(|c| c.is_ascii_digit())
+                && p[1].text.chars().next().is_some_and(|c| c.is_ascii_digit())
+        });
+        // A run of sub-tracking gaps holds ONE letter-spaced word — never two.
+        // So count the pieces that could stand alone as words (3+ letters): a
+        // fragmented word has at most one ("D"+"EFINITIONS", "O"+"ffic"+"e",
+        // "Reta"+"i"+"l"), while two or more means these are whole words whose
+        // spaces merely fell under the bar. They do fall under it: the threshold
+        // is a fraction of the font size, and a condensed face defeats it — on a
+        // comparable-sale table set at 8.1pt with 1.10pt spaces (0.135 em, under
+        // the 0.16 bar) "THE EQUITABLE LIFE INSURANCE" welded into one token.
+        // Nothing downstream could notice, because no character was lost: recall
+        // stayed perfect and the vendor simply stopped being searchable.
+        //
+        // Counting WORDS rather than measuring length is what keeps the repair
+        // this exists for. A small-caps heading trailed by a dot leader —
+        // "D" + "EFINITIONS" + "......" — is three pieces and 60-odd characters,
+        // so any length-based test rejects it, but it is one word and must join.
+        let wordish = ws[i..j]
             .iter()
-            .any(|w| w.text.chars().any(|c| c.is_ascii_digit() || c == '$'));
-        let two_ok = ws[i..j].iter().any(piece) && !numeric;
-        if n >= 3 || (n == 2 && two_ok) {
+            .filter(|w| w.text.chars().filter(|c| c.is_alphabetic()).count() >= 3)
+            .count();
+        // A gap of ZERO is not a narrow space — it is no space at all, and a
+        // renderer that splits a word mid-token (a font or encoding change on
+        // the "stry" of "Ministry") leaves exactly that. Two real neighbours
+        // always carry some gap: even the tightest cell pair in this corpus sits
+        // at 0.086 em. So a hairline run is one word however long its pieces
+        // are, which is the only way "Mini|stry of Envir|onment (MO|E)" comes
+        // back as text a reader can search. Digits stay out of it — a coincident
+        // cell boundary must never be allowed to mint a number.
+        let has_digit = ws[i..j].iter().any(|w| w.text.chars().any(|c| c.is_ascii_digit()));
+        let hairline = widest < 0.02 && !has_digit;
+        if !welds_digits && (hairline || (n >= 3 && wordish <= 1) || (n == 2 && two_ok)) {
             let mut m = ws[i].clone();
             for w in &ws[i + 1..j] {
                 m.text.push_str(&w.text);
@@ -746,6 +791,31 @@ pub fn body_size(lines: &[Line]) -> f64 {
 /// ordinary content on page 1 and is only revealed as chrome by appearing on
 /// all 59. Requiring a consistent margin position keeps a genuinely repeated
 /// body sentence (a defined term, a recurring clause) out of the set.
+/// Is this line page furniture — a head or foot in the margin, set no larger
+/// than body text?
+///
+/// `running_chrome` is furniture that also REPEATS, which is the evidence it
+/// needs before deleting anything. This is the same geometry without that
+/// evidence, and it exists for a different question: not "may I remove this"
+/// but "is there anything on this page except furniture". A footer carrying a
+/// page number never repeats verbatim, so it is invisible to the chrome set —
+/// and a page holding only that footer over a full-page scan would otherwise
+/// read as a text page and never be sent to OCR.
+///
+/// The size guard is the same one and matters for the same reason: a section
+/// heading sits in the top band, and treating it as furniture would let a page
+/// carrying a real title be called empty.
+pub fn is_furniture(l: &Line, page_h: f64, body: f64) -> bool {
+    if page_h <= 0.0 {
+        return false;
+    }
+    let rel = l.y / page_h;
+    if (0.08..=0.92).contains(&rel) {
+        return false;
+    }
+    !(body > 0.0 && l.size > body * 1.02)
+}
+
 pub fn running_chrome(
     pages: &[(Vec<Line>, f64)],
     min_pages: usize,
@@ -860,6 +930,95 @@ mod tests {
         let m = merge_tracking(ws);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].text, "Total");
+    }
+
+    #[test]
+    fn whole_words_do_not_weld_in_a_condensed_face() {
+        // "THE EQUITABLE LIFE INSURANCE" off a comparable-sale table: 8.1pt type
+        // with 1.10pt spaces — 0.135 em, under the 0.16 tracking bar — so every
+        // gap in the run reads as sub-tracking and the run is four long. Before
+        // the length guard this welded to one unsearchable token.
+        let ws = line(8.12, &[
+            (422.03, 435.49, "THE"), (436.59, 474.52, "EQUITABLE"),
+            (475.62, 489.74, "LIFE"), (490.84, 530.09, "INSURANCE"),
+        ]).words;
+        let m = merge_tracking(ws);
+        assert_eq!(m.len(), 4, "four whole words must survive a narrow space");
+        assert_eq!(m[1].text, "EQUITABLE");
+    }
+
+    #[test]
+    fn a_short_stub_does_not_license_welding_its_long_neighbours() {
+        // "& Cultural Industries" at 4.35pt: the one-character "&" made the run
+        // three long, and length-blind logic joined all three.
+        let ws = line(4.35, &[
+            (322.6, 325.0, "&"), (326.46, 340.44, "Cultural"),
+            (341.05, 358.51, "Industries"),
+        ]).words;
+        assert_eq!(merge_tracking(ws).len(), 3, "long pieces are words, not fragments");
+    }
+
+    #[test]
+    fn a_three_piece_letter_split_still_joins() {
+        // The guard must not cost the repair it exists for: short pieces join.
+        let ws = line(7.0, &[(0.0, 20.0, "Reta"), (20.4, 23.0, "i"), (23.3, 26.0, "l")]).words;
+        let m = merge_tracking(ws);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].text, "Retail");
+    }
+
+    #[test]
+    fn a_word_split_at_a_zero_gap_rejoins() {
+        // "Ministry of Environment (MOE)" off an ESA reference list. Poppler
+        // splits mid-word at a font change and the pieces ABUT — gap 0.000 — so
+        // neither is a short stub and the two-piece rule left them apart:
+        // "Mini stry of Envir onment (MO E)". A zero gap is not a space.
+        let ws = line(10.16, &[(153.40, 173.19, "Mini"), (173.19, 190.45, "stry")]).words;
+        let m = merge_tracking(ws);
+        assert_eq!(m.len(), 1, "a zero gap is a split word, not two words");
+        assert_eq!(m[0].text, "Ministry");
+    }
+
+    #[test]
+    fn stacked_text_runs_do_not_read_as_one_word() {
+        // Two lines of an address cell drawn at the same x and 0.74pt apart in
+        // y: the line clusterer sees one line, and sorting puts "Montréal"
+        // before the street it sits under, so the gap is -59pt. Only its SIGN
+        // made that look hairline.
+        let ws = line(9.09, &[(140.97, 200.30, "Sainte-Catherine"), (140.97, 171.66, "Montréal")]).words;
+        assert_eq!(merge_tracking(ws).len(), 2, "an overlap is not a zero gap");
+    }
+
+    #[test]
+    fn a_zero_gap_never_joins_digits() {
+        // The hairline rule must not become a way to mint a figure: two cells
+        // that happen to abut exactly stay two cells when digits are involved.
+        let ws = line(7.0, &[(400.0, 418.0, "$318"), (418.0, 428.0, "12")]).words;
+        assert_eq!(merge_tracking(ws).len(), 2, "digits never weld, gap or no gap");
+    }
+
+    #[test]
+    fn a_small_cap_head_joins_across_its_dot_leader() {
+        // A lease's table of contents: "DEFINITIONS" is set in small caps, so
+        // poppler reports the cap and the rest as two words, and the dot leader
+        // runs up against them as a third. One word, three pieces, sixty
+        // characters — a length-based guard rejects it and the entry loses its
+        // name. Only the leading cap and the body are wordish, so it joins.
+        let ws = line(9.0, &[
+            (0.0, 7.0, "D"), (7.3, 60.0, "EFINITIONS"),
+            (60.4, 300.0, "........................................"), (300.4, 310.0, "3"),
+        ]).words;
+        let m = merge_tracking(ws);
+        assert_eq!(m.len(), 1);
+        assert!(m[0].text.starts_with("DEFINITIONS"), "got {:?}", m[0].text);
+    }
+
+    #[test]
+    fn three_touching_numeric_cells_do_not_weld() {
+        // The n>=3 branch used to bypass the numeric guard entirely, so three
+        // adjacent right-aligned figures could weld into one invented number.
+        let ws = line(7.0, &[(400.0, 418.0, "$318"), (418.6, 428.0, "12"), (428.5, 438.0, "34")]).words;
+        assert_eq!(merge_tracking(ws).len(), 3, "digits must never weld");
     }
 
     #[test]
