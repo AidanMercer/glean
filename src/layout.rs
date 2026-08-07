@@ -205,7 +205,7 @@ fn merge_tracking(ws: Vec<Word>) -> Vec<Word> {
                 // slightly negative, but a LARGE negative gap means the pieces
                 // overlap or arrive out of order — two text runs stacked at the
                 // same x, not one split word. Signing this away once welded an
-                // address block into "Sainte-CatherineMontréal".
+                // address block into one token.
                 widest = widest.max((gap / em).abs());
                 j += 1;
             } else {
@@ -244,7 +244,7 @@ fn merge_tracking(ws: Vec<Word>) -> Vec<Word> {
         // spaces merely fell under the bar. They do fall under it: the threshold
         // is a fraction of the font size, and a condensed face defeats it — on a
         // comparable-sale table set at 8.1pt with 1.10pt spaces (0.135 em, under
-        // the 0.16 bar) "THE EQUITABLE LIFE INSURANCE" welded into one token.
+        // the 0.16 bar) a four-word counterparty name welded into one token.
         // Nothing downstream could notice, because no character was lost: recall
         // stayed perfect and the vendor simply stopped being searchable.
         //
@@ -934,17 +934,17 @@ mod tests {
 
     #[test]
     fn whole_words_do_not_weld_in_a_condensed_face() {
-        // "THE EQUITABLE LIFE INSURANCE" off a comparable-sale table: 8.1pt type
+        // A four-word vendor name off a comparable-sale table: 8.1pt type
         // with 1.10pt spaces — 0.135 em, under the 0.16 tracking bar — so every
         // gap in the run reads as sub-tracking and the run is four long. Before
         // the length guard this welded to one unsearchable token.
         let ws = line(8.12, &[
-            (422.03, 435.49, "THE"), (436.59, 474.52, "EQUITABLE"),
-            (475.62, 489.74, "LIFE"), (490.84, 530.09, "INSURANCE"),
+            (422.03, 435.49, "THE"), (436.59, 474.52, "NORTHERN"),
+            (475.62, 489.74, "LIFE"), (490.84, 530.09, "ASSURANCE"),
         ]).words;
         let m = merge_tracking(ws);
         assert_eq!(m.len(), 4, "four whole words must survive a narrow space");
-        assert_eq!(m[1].text, "EQUITABLE");
+        assert_eq!(m[1].text, "NORTHERN");
     }
 
     #[test]
@@ -985,7 +985,7 @@ mod tests {
         // y: the line clusterer sees one line, and sorting puts "Montréal"
         // before the street it sits under, so the gap is -59pt. Only its SIGN
         // made that look hairline.
-        let ws = line(9.09, &[(140.97, 200.30, "Sainte-Catherine"), (140.97, 171.66, "Montréal")]).words;
+        let ws = line(9.09, &[(140.97, 200.30, "Rue-Sainte-Anne"), (140.97, 171.66, "Gatineau")]).words;
         assert_eq!(merge_tracking(ws).len(), 2, "an overlap is not a zero gap");
     }
 

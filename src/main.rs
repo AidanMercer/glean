@@ -364,10 +364,9 @@ fn main() -> ExitCode {
     // The budget is a fraction of what a page of THIS document normally carries,
     // not a fixed word count: "a tenth of a typical page" means the same thing in
     // a dense lease and an airy CIM, where any constant is wrong in one of them.
-    // A flat twelve words missed a CIM page headed
-    // "Cameron Stephens Mortgage Capital Ltd. / Memnon Management Inc. — 235
-    // Carlaw Ave / Appendix B Rent Roll" — nineteen words of title over a rent
-    // roll that exists only as a picture. The floor keeps the rule from
+    // A flat twelve words missed a CIM page headed with a lender line, a
+    // borrower line and "Appendix B Rent Roll" — nineteen words of title over a
+    // rent roll that exists only as a picture. The floor keeps the rule from
     // vanishing on a document of sparse pages.
     const THIN_WORDS_FLOOR: usize = 12;
     const THIN_SHARE: usize = 10;
@@ -375,7 +374,7 @@ fn main() -> ExitCode {
     // A page whose whole text layer is the running head is READABLE but says
     // nothing — and what it says nothing about is usually a full-page image.
     // An appraisal reproduces the zoning bylaw as a scanned insert; the text
-    // layer carries "Victoria Park, 370-382 Victoria Avenue" and "Page 65", and
+    // layer carries the running head and "Page 65", and
     // the bilingual table of provisions is pixels. Judged on `has_text` alone
     // that page is Text, is never sent to OCR, and the provisions are lost with
     // no warning — the worst failure available, because it is silent.
@@ -956,7 +955,7 @@ mod tests {
     fn a_figure_on_a_text_free_page_is_the_page() {
         // The 0.36-coverage map that is a FIGURE on a page of prose is the whole
         // content of a page whose only text is "Location Overview" and a running
-        // head — the real one off the Victoria appraisal, demographics printed
+        // head — a real one off an appraisal, demographics printed
         // inside it. classify() reserves Scan for a full-bleed raster and is
         // right to; classify_thin asks the other question.
         let map = img(1, 80.0, 300.0, 530.0, 690.0);
