@@ -32,8 +32,30 @@
 #include <array>
 #include <vector>
 #include <mutex>
+#include <type_traits>
 
 namespace {
+
+// ── poppler renamed ImageStream::reset() to rewind() ────────────────────────
+// The method that positions an ImageStream at its first row is `rewind()` on
+// current poppler and `reset()` on older releases — Debian bookworm still ships
+// 22.12, where `reset()` returns void. Calling either one by name pins glean to
+// half the distributions it would otherwise build on, and the failure is a hard
+// compile error rather than something a user can work around.
+//
+// Detected rather than version-tested, deliberately: POPPLER_VERSION is a
+// STRING in poppler-config.h, so a preprocessor comparison cannot read it, and
+// hard-coding the release that made the change is a fact this file would then
+// have to keep being right about. Overload ranking (int beats long for a literal
+// 0) picks `rewind()` wherever it exists and falls back to `reset()` where it
+// does not; the return type is normalised to bool because the old one has none.
+template <typename T>
+auto image_stream_start(T *s, int) -> decltype(s->rewind(), bool()) {
+    if constexpr (std::is_void_v<decltype(s->rewind())>) { s->rewind(); return true; }
+    else return s->rewind();
+}
+template <typename T>
+bool image_stream_start(T *s, long) { s->reset(); return true; }
 
 struct Rec {
     int page;
@@ -154,7 +176,7 @@ public:
 
         ImageStream *imgStr =
             new ImageStream(str, width, colorMap->getNumPixelComps(), colorMap->getBits());
-        if (!imgStr->rewind()) { delete imgStr; return; }
+        if (!image_stream_start(imgStr, 0)) { delete imgStr; return; }
 
         std::vector<unsigned char> rgb((size_t)width * height * 3, 0);
         for (int y = 0; y < height; y++) {
