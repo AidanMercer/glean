@@ -589,9 +589,28 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
     // Accounting layout puts the currency symbol in its own cell, left-aligned
     // against a right-aligned figure, so a corridor opens between them and "$"
     // becomes a column of its own: `| $ | 20.08 |`. Fold any column whose every
-    // entry is a bare symbol into the one after it.
+    // entry is a bare symbol into the figure it belongs to.
+    //
+    // ⚠ WHICH SIDE THE FIGURE IS ON IS NOT FIXED, AND ASSUMING IT COSTS THE
+    // BINDING ON HALF A BILINGUAL CORPUS. English accounting writes `$ 20.08`;
+    // French-Canadian writes `3 900 000,00 $`, with the symbol trailing. A fold
+    // that only ever reaches rightwards leaves "$" standing as its own column on
+    // every Quebec document. No character is lost and a recall metric scores it
+    // perfectly — what breaks is that the amount no longer says what unit it is
+    // in, the same failure the two-tier header fold exists to prevent.
+    //
+    // The geometry settles it without guessing: a symbol sits FAR from the
+    // column it merely neighbours and NEAR the figure it qualifies. On a Quebec
+    // land registry the "$" is 2.7pt from the amount on its left and 108pt from
+    // the reference number on its right; in the English accounting case it is
+    // 42pt from its figure on the right and 90pt from the label on its left.
+    // One rule resolves both. Ties keep the rightward fold, so the prefix case
+    // cannot regress.
+    // The typographic scale this table is set at — the only thing that makes a
+    // gap measured in points mean anything. Same estimate `corridors` uses.
+    let em = median(&mut rows.iter().map(|l| l.size).collect::<Vec<_>>()).max(1.0);
     let mut c = 0;
-    while c + 1 < g.ncol() {
+    while c < g.ncol() {
         // Judge on the body only: the header cell above a "$" column holds the
         // measure's name ("Base", "Year"), which would otherwise disqualify it.
         let skip = usize::from(g.text.len() > 2);
@@ -604,13 +623,86 @@ fn build_table(rows: &[&Line]) -> Option<Table> {
             .iter()
             .filter(|v| matches!(v.trim(), "$" | "-" | "—" | "(" | ")"))
             .count();
-        let symbolic = filled.len() >= 2 && syms * 5 >= filled.len() * 4;
-        if symbolic {
+        // ⚠ THE FRACTION NEEDS A FLOOR OF ONE, for the same reason the spanning
+        // header's corridor allowance does: a short column loses its straggler
+        // budget to rounding and fails where a long one survives by luck. A
+        // registry column reading ["$", "$", "922", "$"] — the "922" a wrapped
+        // fragment of `Réf. : 27 974 922` that crossed the corridor — scores
+        // 3*5 >= 4*4, which is 15 >= 16, and misses by one. Four entries is not
+        // a reason to demand perfection when twenty entries would tolerate four.
+        let strays = filled.len() - syms;
+        let symbolic = syms >= 2 && (syms * 5 >= filled.len() * 4 || strays <= 1);
+        if !symbolic {
+            c += 1;
+            continue;
+        }
+
+        // Median horizontal gap from the symbol column to a neighbour, measured
+        // between the edges that face each other. Median rather than mean so a
+        // single ragged row cannot decide the direction for the whole table.
+        let gap = |to: usize| -> Option<f64> {
+            let mut gaps: Vec<f64> = Vec::new();
+            for row in g.boxes.iter().skip(skip) {
+                let (Some(s), Some(o)) =
+                    (row.get(c).copied().flatten(), row.get(to).copied().flatten())
+                else {
+                    continue;
+                };
+                gaps.push(if to > c { o[0] - s[2] } else { s[0] - o[2] });
+            }
+            if gaps.is_empty() {
+                return None;
+            }
+            gaps.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            Some(gaps[gaps.len() / 2])
+        };
+
+        let right = if c + 1 < g.ncol() { gap(c + 1) } else { None };
+        let left = if c >= 1 { gap(c - 1) } else { None };
+        // ⚠ PROXIMITY ALONE IS NOT THE DISCRIMINATOR, AND TRUSTING IT CORRUPTS
+        // ACCOUNTING TABLES. In a "$ | figure" layout the PREVIOUS column's
+        // figure is right-aligned and ends close to the next "$", so the nearer
+        // neighbour is frequently the wrong one: on a real reserve-fund schedule
+        // the symbol columns measure 17pt left and 26pt right, and folding to
+        // the nearer shifted every value one column and welded "$-" pairs
+        // together. Both gaps there are COLUMN gaps; neither is a space.
+        //
+        // What actually marks a trailing symbol is that it is a SPACE from its
+        // number — one token that a corridor happened to split — while the
+        // column beyond it is a long way off. On the Quebec registry that is
+        // 2.7pt against 102.9pt, at an em of ~7pt: well under a space, and 38×
+        // nearer. The reserve-fund schedule satisfies neither test. Both
+        // conditions are required, so the established rightward fold keeps
+        // every case it already handled.
+        let trailing = match (left, right) {
+            (Some(l), Some(r)) => l < em * 0.75 && r > l * 3.0,
+            // Nothing to the right at all: a symbol column ending the table
+            // belongs to the figure before it or to nothing.
+            (Some(l), None) => l < em * 0.75,
+            _ => false,
+        };
+        let rightward = !trailing && c + 1 < g.ncol();
+
+        if rightward && c + 1 < g.ncol() {
             g.collapse(c, |_, sym, b| match (sym.is_empty(), b.is_empty()) {
                 (true, _) => b.to_string(),
                 (_, true) => sym.to_string(),
                 _ => format!("{sym}{b}"),
             });
+            // The survivor now sits at `c` and is no longer symbolic, so the
+            // next pass walks past it.
+        } else if !rightward {
+            // Fold the FIGURE into the symbol's column, so the surviving cell
+            // reads as the source writes it: `3 900 000,00 $`. Separated by a
+            // space, because that is the French convention and welding them
+            // would make the amount harder to read back, not easier.
+            g.collapse(c - 1, |_, fig, sym| match (fig.is_empty(), sym.is_empty()) {
+                (true, _) => sym.to_string(),
+                (_, true) => fig.to_string(),
+                _ => format!("{fig} {sym}"),
+            });
+            // Columns shifted left by one, so `c` now addresses whatever
+            // followed the merged pair — which is where scanning resumes.
         } else {
             c += 1;
         }
@@ -1090,6 +1182,102 @@ mod tests {
         assert!(
             body.iter().any(|r| r.iter().any(|c| c.trim() == "$20.08")),
             "expected $20.08, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_currency_symbol_folds_back_into_its_figure() {
+        // French-Canadian convention, taken from a Quebec land registry: the
+        // amount is right-aligned and its "$" trails two points later, with a
+        // wide corridor before the next column. Folding rightwards — the only
+        // direction this used to reach — would weld the symbol onto a
+        // registration number and leave the amount with no unit.
+        let g = grid(8.0, &[
+            vec![(0.0, 60.0, "Date"), (100.0, 160.0, "Montant"), (300.0, 380.0, "Réf")],
+            vec![(0.0, 60.0, "2022-09-14"), (100.0, 157.0, "3 900 000,00"),
+                 (159.0, 165.0, "$"), (300.0, 380.0, "6 285 599 T")],
+            vec![(0.0, 60.0, "2023-02-08"), (100.0, 157.0, "15 000 000,00"),
+                 (159.0, 165.0, "$"), (300.0, 380.0, "6 568 142 T")],
+            vec![(0.0, 60.0, "2023-04-25"), (100.0, 157.0, "21 951,40"),
+                 (159.0, 165.0, "$"), (300.0, 380.0, "T 28 074 448")],
+        ]);
+        let body: Vec<&Vec<String>> = g.iter().skip(1).collect();
+        for r in &body {
+            assert!(
+                !r.iter().any(|c| c.trim() == "$"),
+                "a trailing $ must not survive as its own cell: {r:?}"
+            );
+        }
+        assert!(
+            body.iter().any(|r| r.iter().any(|c| c.trim() == "3 900 000,00 $")),
+            "expected the amount to keep its symbol, got {body:?}"
+        );
+        // The registration number must not have absorbed it.
+        assert!(
+            !body.iter().any(|r| r.iter().any(|c| c.contains("$6 285 599"))),
+            "the symbol was folded onto the wrong neighbour: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_nearer_left_neighbour_does_not_steal_an_accounting_symbol() {
+        // The regression the two-condition rule exists to prevent, taken from a
+        // reserve-fund schedule. The previous column's figure is right-aligned
+        // and ends 17pt before the next "$", while that "$"'s own figure starts
+        // 26pt after it — so the NEARER neighbour is the wrong one. Both are
+        // column gaps and neither is a space (17pt is 2.1em at this scale).
+        // Folding to whichever is nearer shifted every value one column and
+        // welded the "$-" nil markers together.
+        let g = grid(8.0, &[
+            vec![(0.0, 60.0, "Poste"), (70.0, 100.0, "2027"), (149.0, 190.0, "2028")],
+            vec![(0.0, 60.0, "Enveloppe"), (70.0, 100.0, "27,000.00"),
+                 (117.0, 123.0, "$"), (149.0, 190.0, "47,000.00")],
+            vec![(0.0, 60.0, "Structure"), (70.0, 100.0, "20,000.00"),
+                 (117.0, 123.0, "$"), (149.0, 190.0, "31,000.00")],
+            vec![(0.0, 60.0, "Total"), (70.0, 100.0, "11,000.00"),
+                 (117.0, 123.0, "$"), (149.0, 190.0, "78,000.00")],
+        ]);
+        let body: Vec<&Vec<String>> = g.iter().skip(1).collect();
+        assert!(
+            body.iter().any(|r| r.iter().any(|c| c.trim() == "$47,000.00")),
+            "the symbol belongs to the figure on its right, got {body:?}"
+        );
+        assert!(
+            !body.iter().any(|r| r.iter().any(|c| c.trim().ends_with(" $"))),
+            "a leading accounting symbol must not be pulled backwards: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_symbol_column_keeps_its_straggler_allowance() {
+        // Four entries, one of them a wrapped fragment that crossed the
+        // corridor — the shape a real registry page takes. The fractional
+        // tolerance alone scores this 15 >= 16 and leaves the "$" standing;
+        // the floor of one is what catches it. A long column with the same
+        // proportion of stragglers has always passed.
+        let g = grid(8.0, &[
+            vec![(0.0, 60.0, "Date"), (100.0, 160.0, "Montant"), (300.0, 380.0, "Réf")],
+            vec![(0.0, 60.0, "2022-09-14"), (100.0, 157.0, "3 900 000,00"),
+                 (159.0, 165.0, "$"), (300.0, 380.0, "6 285 599 T")],
+            vec![(0.0, 60.0, "2023-02-08"), (100.0, 157.0, "15 000 000,00"),
+                 (159.0, 165.0, "$"), (300.0, 380.0, "6 568 142 T")],
+            vec![(0.0, 60.0, "2023-05-11"), (100.0, 157.0, "Réf. : 27 974"),
+                 (159.0, 172.0, "922"), (300.0, 380.0, "T 28 074 448")],
+            vec![(0.0, 60.0, "2024-04-26"), (100.0, 157.0, "22 000 000,00"),
+                 (159.0, 165.0, "$"), (300.0, 380.0, "6 742 178")],
+        ]);
+        let body: Vec<&Vec<String>> = g.iter().skip(1).collect();
+        for r in &body {
+            assert!(
+                !r.iter().any(|c| c.trim() == "$"),
+                "one straggler must not cost a short column its fold: {r:?}"
+            );
+        }
+        // The straggler rejoins the value it was split from rather than being
+        // dropped or welded onto the wrong side.
+        assert!(
+            body.iter().any(|r| r.iter().any(|c| c.trim() == "Réf. : 27 974 922")),
+            "the wrapped fragment should rejoin its own value, got {body:?}"
         );
     }
 
