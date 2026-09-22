@@ -15,6 +15,14 @@ struct GImage {
     path: *const c_char,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GInk {
+    page: c_int,
+    paths: c_int,
+    glyphs: c_int,
+}
+
 #[allow(non_camel_case_types)]
 enum GImages {}
 
@@ -33,7 +41,7 @@ extern "C" {
     fn glean_images_probe(pdf: *const c_char, first: c_int, last: c_int, min_px: c_int)
         -> *mut GImages;
     fn glean_ink_count(g: *mut GImages) -> c_int;
-    fn glean_ink_data(g: *mut GImages) -> *const c_int;
+    fn glean_ink_data(g: *mut GImages) -> *const GInk;
     fn glean_render_pages(
         pdf: *const c_char,
         outdir: *const c_char,
@@ -87,9 +95,11 @@ impl Image {
 pub enum PageKind {
     /// The page has a text layer and was read.
     Text,
-    /// A page-sized raster with no text: a scan. This is the one that needs OCR.
+    /// No text and something drawn that could hold words: a page-sized raster,
+    /// or vector ink of any size. This is the one that needs OCR.
     Scan,
-    /// Rasters or vector ink, but nothing page-sized: a figure or a chart.
+    /// Small rasters, no text, no ink: a plate of photographs. Nothing on it
+    /// can be read by OCR either.
     Image,
     /// No text, no ink, no rasters. Nothing is missing.
     Blank,
@@ -106,10 +116,46 @@ impl PageKind {
     }
 }
 
+/// One page's vector ink, as the survey counts it: every stroke and fill, and
+/// the glyph-sized subset (see `GLYPH_INK_MIN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ink {
+    pub page: usize,
+    pub paths: usize,
+    pub glyphs: usize,
+}
+
+/// The ink on one page, if the survey saw any.
+pub fn ink_on(page: usize, ink: &[Ink]) -> Option<&Ink> {
+    ink.iter().find(|k| k.page == page)
+}
+
 /// A raster covering this much of the page is the page, not a picture on it.
 /// Deliberately well below 1.0: a scan is inset by its margins, and 235 Carlaw's
 /// scanned appendices land at 0.86–0.94 of the page box.
 pub const SCAN_COVERAGE: f64 = 0.5;
+
+/// This many glyph-sized fills on a page is text drawn as curves — a PDF whose
+/// fonts were outlined at print time, which is how a "scanned" form arrives
+/// with typed answers as the only real fonts (5775 Rue Ferrier's estoppel:
+/// 80,000 path operators over three pages, two fonts, 31 words). A table draws
+/// its rules as a few dozen long paths and a chart its bars as a few hundred
+/// wide ones; neither reaches a hundred letter-sized fills. A line of outlined
+/// 12pt type is about eighty. So a hundred is roughly "more than one line of
+/// text that only OCR can read", and the cost of being wrong about a page is
+/// one page of OCR.
+pub const GLYPH_INK_MIN: usize = 100;
+
+/// A page that holds this many words or fewer, after the running chrome and
+/// the margin furniture are set aside, is SPARSE: not thin enough to be judged
+/// by `classify_thin`'s liberal rule, but nowhere near a page of prose (300–600
+/// words on a letter sheet). A form filled in by typewriter carries tens of
+/// words over printed labels; whether those labels are readable is what the
+/// survey then asks. Sixty is set between the fullest typed-overlay page on
+/// file (31 words, the Ferrier Exhibit A) and the sparsest page that is
+/// genuinely text (an operating statement with a small table: ~50 words over
+/// a few dozen rules — which the glyph bar, not the word count, keeps out).
+pub const SPARSE_WORDS_MAX: usize = 60;
 
 /// Initialise poppler's process-wide state before any worker thread exists.
 /// See the note on `glean_init` in images.cpp — poppler-cpp races its own
@@ -121,7 +167,7 @@ pub fn init() {
 
 /// Where every raster sits, and which pages carry path ink — without decoding a
 /// pixel or writing a file. Used to classify the pages that produced no words.
-pub fn probe(pdf: &str, first: usize, last: usize) -> Result<(Vec<Image>, Vec<usize>), String> {
+pub fn probe(pdf: &str, first: usize, last: usize) -> Result<(Vec<Image>, Vec<Ink>), String> {
     let p = CString::new(pdf).map_err(|e| e.to_string())?;
     // 16px, not the --images default of 64: this is asking "is there anything
     // here", not "is this worth keeping", and a low-resolution fax scan is still
@@ -152,22 +198,61 @@ pub fn probe(pdf: &str, first: usize, last: usize) -> Result<(Vec<Image>, Vec<us
     let mut ink = Vec::with_capacity(m);
     if m > 0 {
         let data = unsafe { std::slice::from_raw_parts(glean_ink_data(g), m) };
-        ink.extend(data.iter().map(|&p| p as usize));
+        ink.extend(data.iter().map(|k| Ink {
+            page: k.page as usize,
+            paths: k.paths.max(0) as usize,
+            glyphs: k.glyphs.max(0) as usize,
+        }));
     }
     unsafe { glean_images_free(g) };
     Ok((imgs, ink))
 }
 
 /// Classify one wordless page from the survey. `page` is 1-based.
-pub fn classify(page: usize, w: f64, h: f64, imgs: &[Image], ink: &[usize]) -> PageKind {
+///
+/// OUTLINED TEXT ON A WORDLESS PAGE IS A SCAN. This used to file every kind of
+/// ink as `Image` ("a figure or a chart"), which no caller sends to OCR. The
+/// 5775 Rue Ferrier estoppel (2026-09-21) is the cost of that: a scanned
+/// certificate whose "scan" is 80,000 path operators — the form outlined at
+/// print time — with the tenant's typed answers as the only fonts. Page 1, the
+/// certificate body, has no words and no raster, was called `image`, and was
+/// never read; page 3 carried the typed answers over the outlined labels, and
+/// the reader saw a security deposit with nothing beside it and called it the
+/// rent. The tell is the SHAPE of the ink, not its presence: thousands of
+/// letter-sized fills are letters. A chart's bars and a drawing's lines stay
+/// `Image`, as does the plate of small photographs — nothing on those reads.
+pub fn classify(page: usize, w: f64, h: f64, imgs: &[Image], ink: &[Ink]) -> PageKind {
     let mine: Vec<&Image> = imgs.iter().filter(|i| i.page == page).collect();
     if mine.iter().any(|i| i.page_fraction(w, h) >= SCAN_COVERAGE) {
         return PageKind::Scan;
     }
-    if !mine.is_empty() || ink.contains(&page) {
+    let k = ink_on(page, ink);
+    if k.is_some_and(|k| k.glyphs >= GLYPH_INK_MIN) {
+        return PageKind::Scan;
+    }
+    if !mine.is_empty() || k.is_some() {
         return PageKind::Image;
     }
     PageKind::Blank
+}
+
+/// A SPARSE page — more words than `classify_thin` will look at, but no more
+/// than `SPARSE_WORDS_MAX` — is promoted to Scan only on the two signals that
+/// mean "the page is a picture with words typed on it": a page-sized raster,
+/// or outlined text in quantity. It is never promoted on ink alone: at this
+/// word count the ink is usually a small table's rules, and a page whose exact
+/// figures are in the text layer must not be traded for an OCR engine's
+/// reading of them. Never demoted either — the words it holds are kept.
+pub fn classify_sparse(page: usize, w: f64, h: f64, imgs: &[Image], ink: &[Ink]) -> PageKind {
+    let raster = imgs
+        .iter()
+        .filter(|i| i.page == page)
+        .any(|i| i.page_fraction(w, h) >= SCAN_COVERAGE);
+    if raster || ink_on(page, ink).is_some_and(|k| k.glyphs >= GLYPH_INK_MIN) {
+        PageKind::Scan
+    } else {
+        PageKind::Text
+    }
 }
 
 /// How much of a text-free page must be picture before the picture is the page.
@@ -238,14 +323,14 @@ pub const THIN_FIGURE_MIN: f64 = 0.10;
 /// is a plate of photos; ink does not, because ink with no text beside it has no
 /// benign reading. A page with neither stays Text — a title over nothing is not
 /// a hole.
-pub fn classify_thin(page: usize, w: f64, h: f64, imgs: &[Image], ink: &[usize]) -> PageKind {
+pub fn classify_thin(page: usize, w: f64, h: f64, imgs: &[Image], ink: &[Ink]) -> PageKind {
     let cover: f64 = imgs
         .iter()
         .filter(|i| i.page == page)
         .filter(|i| i.page_fraction(w, h) >= THIN_FIGURE_MIN)
         .map(|i| i.page_fraction(w, h))
         .sum();
-    if cover.min(1.0) >= THIN_IMAGE_COVERAGE || ink.contains(&page) {
+    if cover.min(1.0) >= THIN_IMAGE_COVERAGE || ink_on(page, ink).is_some() {
         PageKind::Scan
     } else {
         PageKind::Text

@@ -300,10 +300,28 @@ struct GImage {
     const char *path;
 };
 
+// One page's vector ink, for the survey. `paths` is every stroke and fill on
+// the page; `glyphs` is the subset small enough to be a letter — the fills a
+// PDF holds when its text was converted to outlines at print time. A table
+// draws tens of long rules; a chart draws hundreds of bars and lines; a page of
+// outlined text draws thousands of glyph-sized fills. The COUNT of small fills
+// is what tells the third from the other two, and the third is the one only
+// OCR can read.
+struct GInk {
+    int page;
+    int paths;
+    int glyphs;
+};
+
+// A path whose box fits inside this many points on both sides is glyph-sized:
+// a 12pt letter is about 8 × 9, a 24pt one about 16 × 18, a checkbox 10. A
+// table rule, a chart bar and a border are all long on at least one side.
+static const double GLYPH_PT = 20.0;
+
 struct GImages {
     std::vector<Rec> recs;
     std::vector<GImage> view;
-    std::vector<int> ink;   // pages carrying path ink (probe only)
+    std::vector<GInk> ink;   // per page carrying path ink, ascending (probe only)
 };
 
 // Extract every image at or above minPx on a side. Returns null on failure.
@@ -509,17 +527,20 @@ GImages *glean_images_probe(const char *pdf, int firstPage, int lastPage, int mi
     g->recs = dev.recs();
     for (const auto &r : g->recs)
         g->view.push_back(GImage{r.page, r.x0, r.y0, r.x1, r.y1, r.w, r.h, nullptr});
+    std::map<int, GInk> perPage;
     for (const auto &b : dev.pathBoxes_) {
         int pg = (int)b[4];
-        if (g->ink.empty() || g->ink.back() != pg) g->ink.push_back(pg);
+        GInk &k = perPage[pg];
+        k.page = pg;
+        k.paths++;
+        if ((b[2] - b[0]) <= GLYPH_PT && (b[3] - b[1]) <= GLYPH_PT) k.glyphs++;
     }
-    std::sort(g->ink.begin(), g->ink.end());
-    g->ink.erase(std::unique(g->ink.begin(), g->ink.end()), g->ink.end());
+    for (const auto &kv : perPage) g->ink.push_back(kv.second);
     return g;
 }
 
 int glean_ink_count(GImages *g) { return g ? (int)g->ink.size() : 0; }
-const int *glean_ink_data(GImages *g) { return g && !g->ink.empty() ? g->ink.data() : nullptr; }
+const GInk *glean_ink_data(GImages *g) { return g && !g->ink.empty() ? g->ink.data() : nullptr; }
 
 int glean_images_count(GImages *g) { return g ? (int)g->view.size() : 0; }
 const GImage *glean_images_data(GImages *g) { return g && !g->view.empty() ? g->view.data() : nullptr; }

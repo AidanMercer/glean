@@ -98,6 +98,10 @@ struct Pages {
     kinds: Vec<imgffi::PageKind>,
     cells: Vec<Vec<TableCells>>,
     survey: Survey,
+    /// Per page, what the survey found — `(paths, glyph-sized paths, largest
+    /// raster's share of the page)` — or `None` for a page the survey never
+    /// needed to look at.
+    probed: Vec<Option<(usize, usize, f64)>>,
 }
 
 fn parse_pages(spec: &str) -> Option<Vec<usize>> {
@@ -368,6 +372,20 @@ fn main() -> ExitCode {
     // borrower line and "Appendix B Rent Roll" — nineteen words of title over a
     // rent roll that exists only as a picture. The floor keeps the rule from
     // vanishing on a document of sparse pages.
+    //
+    // ⚠ A DOCUMENT WHOSE EVERY PAGE IS SPARSE DEFEATS THE RELATIVE RULE BY
+    // CONSTRUCTION, and the floor cannot simply be raised to meet it. The 5775
+    // Rue Ferrier estoppel (2026-09-21): three pages, a scanned form outlined
+    // at print time with the tenant's typed answers as the only fonts — 0, 1
+    // and 31 words. Its median page holds 16 words, a tenth of that is 1, and
+    // at a floor of twelve the 31-word Exhibit A page was TWICE the document's
+    // typical page and so never surveyed. Raising the floor to sixty was
+    // measured and rejected: the thin rule promotes on ANY ink, and at fifty
+    // words the ink is usually a small table's rules — a one-page operating
+    // statement whose exact figures sit in the text layer was traded for an
+    // OCR reading of them. So the band above the floor is a SECOND, stricter
+    // survey (`classify_sparse`): up to `SPARSE_WORDS_MAX` words, promoted only
+    // over a page-sized raster or outlined text in quantity, never on ink alone.
     const THIN_WORDS_FLOOR: usize = 12;
     const THIN_SHARE: usize = 10;
 
@@ -419,9 +437,15 @@ fn main() -> ExitCode {
         let med = layout::median(&mut real) as usize;
         (med / THIN_SHARE).max(THIN_WORDS_FLOOR)
     };
+    let mut sparse: Vec<usize> = Vec::new();
     for (slot, b) in bare.iter().enumerate() {
-        if kinds[slot] == imgffi::PageKind::Text && *b <= budget {
+        if kinds[slot] != imgffi::PageKind::Text {
+            continue;
+        }
+        if *b <= budget {
             thin.push(slot);
+        } else if *b <= imgffi::SPARSE_WORDS_MAX {
+            sparse.push(slot);
         }
     }
 
@@ -431,9 +455,15 @@ fn main() -> ExitCode {
     let mut wordless: Vec<usize> =
         (0..wanted.len()).filter(|&s| kinds[s] != imgffi::PageKind::Text).collect();
     let thin_set: std::collections::HashSet<usize> = thin.iter().copied().collect();
+    let sparse_set: std::collections::HashSet<usize> = sparse.iter().copied().collect();
     wordless.extend(thin.iter().copied());
+    wordless.extend(sparse.iter().copied());
     wordless.sort_unstable();
     let mut surveyed: Vec<imgffi::Image> = Vec::new();
+    // What the survey saw on each page it looked at, for the JSON: a consumer
+    // routing on `kind` can see WHY a page was called a scan, and a threshold
+    // can be measured over a corpus instead of argued about.
+    let mut probed: Vec<Option<(usize, usize, f64)>> = vec![None; wanted.len()];
     if !wordless.is_empty() {
         let lo = wanted[wordless[0]] + 1;
         let hi = wanted[*wordless.last().unwrap()] + 1;
@@ -441,16 +471,28 @@ fn main() -> ExitCode {
             Ok((imgs, ink)) => {
                 for &slot in &wordless {
                     let (page, w, h) = (wanted[slot] + 1, widths[slot], pages[slot].1);
+                    let k = imgffi::ink_on(page, &ink);
+                    probed[slot] = Some((
+                        k.map_or(0, |k| k.paths),
+                        k.map_or(0, |k| k.glyphs),
+                        imgs.iter()
+                            .filter(|i| i.page == page)
+                            .map(|i| i.page_fraction(w, h).min(1.0))
+                            .fold(0.0, f64::max),
+                    ));
                     // A thin page is judged on its own terms (see classify_thin)
                     // and can only ever be PROMOTED to Scan. It is never called
                     // Blank or Image: this page holds words, and a survey must
                     // not deny text we are already carrying.
+                    let held = thin_set.contains(&slot) || sparse_set.contains(&slot);
                     let k = if thin_set.contains(&slot) {
                         imgffi::classify_thin(page, w, h, &imgs, &ink)
+                    } else if sparse_set.contains(&slot) {
+                        imgffi::classify_sparse(page, w, h, &imgs, &ink)
                     } else {
                         imgffi::classify(page, w, h, &imgs, &ink)
                     };
-                    if thin_set.contains(&slot) && k != imgffi::PageKind::Scan {
+                    if held && k != imgffi::PageKind::Scan {
                         continue;
                     }
                     kinds[slot] = k;
@@ -472,7 +514,7 @@ fn main() -> ExitCode {
         image_only: pages_of(imgffi::PageKind::Image),
         blank: pages_of(imgffi::PageKind::Blank).len(),
     };
-    let page_data = Pages { markdown: out, kinds, cells, survey };
+    let page_data = Pages { markdown: out, kinds, cells, survey, probed };
     let out = &page_data.markdown;
     let survey = &page_data.survey;
 
@@ -792,6 +834,14 @@ fn render_json(
             pg.kinds[slot].as_str(),
             jesc(md)
         ));
+        // Only for a page the survey looked at. Absent means "had words enough
+        // that nothing was asked", not "no ink" — a consumer must not read
+        // silence as a finding.
+        if let Some((paths, glyphs, raster)) = pg.probed.get(slot).copied().flatten() {
+            s.push_str(&format!(
+                ", \"ink_paths\": {paths}, \"ink_glyphs\": {glyphs}, \"raster\": {raster:.3}"
+            ));
+        }
         if !imgs.is_empty() {
             s.push_str(", \"images\": [");
             for (k, i) in imgs.iter().enumerate() {
@@ -1019,11 +1069,56 @@ mod tests {
         assert_eq!(imgffi::native_dpi(1, &[icon]), imgffi::OCR_DPI_MAX);
     }
 
+    fn ink(page: usize, paths: usize, glyphs: usize) -> imgffi::Ink {
+        imgffi::Ink { page, paths, glyphs }
+    }
+
     #[test]
     fn vector_ink_is_not_a_blank_page() {
         // A chart drawn with path operators has no words and no raster. It is
-        // not a scan, but it is not nothing either.
-        assert_eq!(classify(7, 612.0, 792.0, &[], &[7]), PageKind::Image);
-        assert_eq!(classify(7, 612.0, 792.0, &[], &[9]), PageKind::Blank);
+        // not a scan — its bars are not letters — but it is not nothing either.
+        assert_eq!(classify(7, 612.0, 792.0, &[], &[ink(7, 240, 6)]), PageKind::Image);
+        assert_eq!(classify(7, 612.0, 792.0, &[], &[ink(9, 240, 6)]), PageKind::Blank);
+    }
+
+    #[test]
+    fn outlined_text_on_a_wordless_page_is_a_scan() {
+        // The 5775 Rue Ferrier estoppel: a scanned certificate whose "scan" is
+        // the form outlined at print time — thousands of letter-sized fills, no
+        // raster, no words on page 1. It was called `image` and never read.
+        assert_eq!(classify(1, 612.0, 792.0, &[], &[ink(1, 4_100, 3_900)]), PageKind::Scan);
+        // The bar is on GLYPH-sized fills. A drawing with the same number of
+        // long strokes is still a drawing.
+        assert_eq!(classify(1, 612.0, 792.0, &[], &[ink(1, 4_100, 40)]), PageKind::Image);
+        // A small raster with no ink is still a picture, not a page to read.
+        let photo = img(7, 100.0, 400.0, 300.0, 550.0);
+        assert_eq!(classify(7, 612.0, 792.0, &[photo], &[]), PageKind::Image);
+    }
+
+    #[test]
+    fn a_sparse_page_is_promoted_only_over_a_scan_or_outlined_text() {
+        // Ferrier's Exhibit A: 31 typed words over the outlined form labels.
+        assert_eq!(imgffi::classify_sparse(3, 612.0, 792.0, &[], &[ink(3, 2_200, 2_050)]), PageKind::Scan);
+        // 235 Carlaw's one-page operating statement: ~50 words in a small
+        // table whose rules are a few dozen long paths. Its figures are in the
+        // text layer and must not be traded for an OCR reading of them.
+        assert_eq!(imgffi::classify_sparse(1, 612.0, 792.0, &[], &[ink(1, 38, 0)]), PageKind::Text);
+        // A typed overlay on a page-sized RASTER is the same shape the other way.
+        let scan = img(2, 20.0, 20.0, 592.0, 772.0);
+        assert_eq!(imgffi::classify_sparse(2, 612.0, 792.0, &[scan], &[]), PageKind::Scan);
+        // A caption beside a figure is a page of text with a picture on it —
+        // classify_thin's quarter-page bar does not apply here.
+        let figure = img(4, 100.0, 300.0, 500.0, 620.0);
+        assert_eq!(imgffi::classify_sparse(4, 612.0, 792.0, &[figure], &[ink(4, 12, 0)]), PageKind::Text);
+        // And nothing at all stays what it was.
+        assert_eq!(imgffi::classify_sparse(5, 612.0, 792.0, &[], &[]), PageKind::Text);
+    }
+
+    #[test]
+    fn a_thin_page_still_promotes_on_any_ink() {
+        // The rule the first unseen document set was paid for: 51 characters of
+        // running head over a page of outlined prose, no raster. Unchanged —
+        // at twelve words or fewer the words traded away are the running head.
+        assert_eq!(imgffi::classify_thin(1, 612.0, 792.0, &[], &[ink(1, 3, 0)]), PageKind::Scan);
     }
 }

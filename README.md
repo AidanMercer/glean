@@ -89,8 +89,8 @@ response so a pipeline written against one can consume the other unchanged:
 | kind | what it is | what to do |
 |---|---|---|
 | `text` | read from the text layer | nothing |
-| `scan` | a page-sized raster, no text | send this page to OCR |
-| `image` | a figure or chart, no text | `--images` if you want the picture |
+| `scan` | a page-sized raster or vector ink, with no words or only a few over it | send this page to OCR |
+| `image` | small pictures, no text, no ink — a plate of photographs | `--images` if you want the pictures |
 | `blank` | no text, no ink, no raster | nothing — nothing is missing |
 
 Only `scan` costs money downstream, and on a mixed document it is usually a
